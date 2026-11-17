@@ -816,6 +816,10 @@ struct Helper {
         case GM_STATUS:
             result = GM_OK;
             break;
+        case GM_UNLOAD:
+            player.Unload();
+            result = GM_OK;
+            break;
         case GM_CLOSE:
             player.Unload();
             result = GM_OK;

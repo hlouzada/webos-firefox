@@ -25,7 +25,8 @@ enum gm_type {
     GM_VOLUME = 16, /* arg0 0..100 */
     GM_EOS = 17,    /* arg0 track */
     GM_STATUS = 19,
-    GM_CLOSE = 20
+    GM_CLOSE = 20,
+    GM_UNLOAD = 21  /* drop the pipeline and keep the helper, the client loads again with GM_LOAD */
 };
 
 enum gm_track { GM_TRACK_VIDEO = 1, GM_TRACK_AUDIO = 2 };

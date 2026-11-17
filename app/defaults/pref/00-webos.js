@@ -271,6 +271,10 @@ pref("browser.newtabpage.activity-stream.discoverystream.reportAds.enabled", fal
 pref("identity.fxaccounts.telemetry.clientAssociationPing.enabled", false);
 pref("browser.crashReports.cleanupCheck.enabled", false);
 
+// Scale. The window is 1920x1080 device pixels viewed from across a room;
+// 1.5 lays pages out at 1280x720 CSS pixels and scales the toolbar with them.
+pref("layout.css.devPixelsPerPx", "1.5");
+
 // Housekeeping.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);

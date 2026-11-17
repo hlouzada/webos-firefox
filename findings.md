@@ -1525,3 +1525,98 @@ clip in a page and then YouTube.
   Whether the decoder was released.
 - Lip sync and 24 fps content on the 60 Hz panel. `videoFpsValue` is the
   stream's rate.
+
+## 22. Fixed: jumping in an HLS video froze it (2026-11-17)
+
+Seen on miruro.tv and animepahe.ch, both HLS through MediaSource with
+hls.js. A jump left the player spinning with the target range shown as
+buffered, or showed a black plane that never came back. Two causes were
+found with `MOZ_LOG=WebOSEngine:5,MediaDecoder:4,MediaFormatReader:4,MediaSource:4`
+in the `env` file. The state machine logs under `MediaDecoder`, and a
+module named `ExternalEngineStateMachine` does not exist.
+
+**The reader kept a cancel as a fatal error.** `WebOSEngineChannel::Seek`
+rejected the sample waiting in the channel with `NS_ERROR_DOM_MEDIA_CANCELED`.
+When that reached `MediaFormatReader` before the reader's own flush, the
+log showed `NotifyError: Video Decoding error: NS_ERROR_DOM_MEDIA_CANCELED`
+right before `Reset(Video) BEGIN`. `DecoderData::HasFatalError()` treats
+every error but `DECODE_ERR` and the process-crash codes as fatal,
+`ResetState()` keeps a fatal error across the reset, and
+`UpdateReceivedNewData()` returns before it resolves the `WaitForData`
+promise, so the seek sat in `SeekingData` for good once hls.js had the
+segment appended (buffered 582 to 630 s, target 587 s), and nothing
+reported it because no data promise was pending to reject. Whether a
+sample was in flight at the instant of the seek decided it. That is why
+some jumps worked. The engine now drops the stale samples and leaves their
+promises to the reader's flush like other decoders do. Sites' players issue
+every seek twice with the same target. That is harmless.
+
+**The decoder died on a level switch.** A jump often lands on a fragment of
+another HLS level. Firefox's `H264ChangeMonitor` sees the in-band SPS
+differ from the init segment, re-creates the pass-through decoder and feeds
+the new IDR with its SPS. The SPS differed as 1920x1080 with a 46 byte avcC
+against 854x480 with 50 bytes. `omxh264dec` then reports `OpenMAX component
+in error state Insufficient resources`, Starfish raises error 100, the
+engine fails and the page recreates the element. The new element loads at
+the same position and dies again. 33 of the 50 error-100 events in the
+day's log carry that OMX line. `WebOSEngineDecoderModule` now tells the
+channel the configuration of every video decoder it creates. When image
+size or extradata differ from the current stream while a pipeline is
+loaded, the channel sends `GM_UNLOAD` and the `pipeline gone` path loads
+again at the position with the next sample. `GM_UNLOAD` is new in
+`src/media-protocol.h` and calls the helper's `Unload()`. The host test is
+scenario `reload` in `tests/media-helper/run.sh`. A level change seen
+before the first load only updates the stored configuration.
+
+Confirmed on the TV with 0.1.50 over nine distinct jumps across two
+episodes, all `Seek completed` and no cancel in the reader. `WebOSEngine:5`
+now logs every `submit` and `fed` sample.
+
+**Log volume.** `MediaFormatReader:4` and `MediaDecoder:4` together write
+about a megabyte per ten seconds of playback and far more while a page
+recreates players in a loop. One six minute run wrote 400 MB and filled the
+2.3 GB app partition, and from then on the install service refuses
+packages. Truncate `geckotv.log` and delete `env` right after a logged run.
+
+### Open, seen in the same logs
+
+- **Ad clips take the hardware decoder.** The pages carry silent 300x250
+  and 950x250 H.264 clips. Each gets its own helper and pipeline, the TV has
+  one `VDEC`, and the resource manager answers with `event 0x12 601
+  Resource Allocation Error` for the loser, or takes the decoder from the
+  pipeline that has it with `event 0x12 600 VDEC resource is released by
+  policy action`. That second event killed the main 1280x720 video after
+  534 frames at 20:11 UTC. The proposed rule is not decided yet. A video
+  with no audio track and 480 lines or less would not use the engine and
+  would decode in software, so the decoder stays with the main video. The
+  check would go in `IsFormatSupportedByExternalEngine` or in the engine's
+  `Init`. The open question is what else is silent and small and should
+  stay on the plane.
+- **A second engine while the first shuts down gets no window.** When a
+  page swaps its video element, the new `WebOSEngineChannel` starts before
+  the old one has closed the adapter socket, logs `no exported window id
+  from the adapter`, opens with `window none`, loads with
+  `"windowId":""`, and every feed answers `RETRY` until the pipeline dies
+  with error 100. The page's retry then gets a window and plays. Section
+  21 lists the one-client socket. The options are to let the adapter
+  accept a second client and hand it the same window, or to make the new
+  channel wait for the socket. The old channel's `adapter link lost: Broken
+  pipe` marks the moment the socket frees.
+- **The state machine spins after an engine failure.** From the failure
+  until the page recreates the element, `ExternalEngineStateMachine`
+  logs `OnRequestAudio ErrorName=NS_ERROR_DOM_MEDIA_CANCELED` about a
+  thousand times per two thousand log lines (6822 in one run, 20850 in
+  another). `OnRequestAudio` re-requests on `CANCELED` at once and the
+  reader rejects at once while its seek promise is pending. This is
+  upstream code and a CPU burner on a 4-core TV. A check in the `CANCELED`
+  branch that the state is still running, or a short delay, would stop it.
+- **A `signal 7` at close.** Closing the app while a video plays prints
+  `webos-xdg: signal 7 addr=0xe5e5e5e9` with a thread id below the content
+  process's pid, so from the parent, then the content process exits with
+  `Exiting due to channel error`. The address is the freed-memory poison,
+  so this is a use-after-free. Seen at several closes with a video playing
+  in today's logs, never during playback. It is harmless to the user and a
+  real bug for a crash reporter. The handler printed bare `pc`/`lr`
+  addresses here instead of `library+offset`, so `build/symbolize-arm32.py`
+  has nothing to resolve yet, and `libxul` from `mach package` has no
+  symbols anyway.

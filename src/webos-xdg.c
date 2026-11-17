@@ -878,9 +878,11 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
 /* Undo what the adapter created for a virtual object and free its slot. */
 static void virt_teardown(struct virt *v)
 {
+    /* The synthetic pointer focus must never outlive its surface. A leave
+     * sent for a destroyed surface is a use after free in GDK. */
+    if (v->wl_surface && synth_focus == (struct wl_surface *)v->wl_surface)
+        synth_focus = NULL;
     if (v->subsurface) {
-        if (synth_focus == (struct wl_surface *)v->wl_surface)
-            synth_focus = NULL;
         wl_subsurface_destroy(v->subsurface);
         v->subsurface = NULL;
     }
@@ -4870,6 +4872,8 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_DESTROY) {
         int slot = layered_slot(proxy);
 
+        if (synth_focus == (struct wl_surface *)proxy)
+            synth_focus = NULL;
         if (slot >= 0)
             forget_slot(slot);
         if (gl_mode())

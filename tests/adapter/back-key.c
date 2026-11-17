@@ -62,6 +62,9 @@ int main(void)
     press(kb, KEY_BACK);
     CHECK(passed_as(KEY_BACK), "Back on a page: passed on as KEY_BACK (XF86Back, the previous page)");
 
+    press(kb, KEY_PREVIOUS);
+    CHECK(passed_as(KEY_BACK), "Back as webOS 6.5 sends it (KEY_PREVIOUS, 412): passed on as KEY_BACK");
+
     press(kb, KEY_EXIT);
     CHECK(got == 0, "Exit is swallowed");
 

@@ -4596,7 +4596,8 @@ static void *remote_thread(void *arg)
                     continue;
                 else if (ev.type == EV_REL && ev.code == REL_WHEEL && ev.value)
                     enqueue_remote(abs_x, abs_y, -2, ev.value);
-                else if (ev.type == EV_KEY && ev.code == KEY_BACK && ev.value == 1)
+                else if (ev.type == EV_KEY && (ev.code == KEY_BACK || ev.code == KEY_PREVIOUS) &&
+                         ev.value == 1)
                     enqueue_remote(abs_x, abs_y, -3, 1);
                 else if (ev.type == EV_KEY && center_button(ev.code))
                     enqueue_remote(abs_x, abs_y, BTN_LEFT, ev.value ? 1 : 0);
@@ -4974,7 +4975,8 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
         log_trace("key %u", key);
-    if (key == KEY_BACK) {
+    /* webOS 6.5 sends the remote's Back as KEY_PREVIOUS (412). */
+    if (key == KEY_BACK || key == KEY_PREVIOUS) {
         if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
             back_as = back_key_code();
         key = back_as;

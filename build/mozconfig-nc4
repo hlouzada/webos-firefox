@@ -36,6 +36,8 @@ ac_add_options --disable-profiling
 ac_add_options --disable-geckodriver
 ac_add_options --enable-strip
 ac_add_options --enable-install-strip
+# Playback through LG's media pipeline (dom/media/platforms/webos).
+ac_add_options --enable-webos-media-engine
 
 # clang takes its C++ headers and libstdc++ from the SDK's GCC 16. That
 # libstdc++ is built for ARMv7 against glibc 2.12, so it needs no __sync

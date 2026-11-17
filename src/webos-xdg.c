@@ -283,6 +283,19 @@ static void read_window_size(void)
 }
 static volatile int mapped_one;
 
+/* GECKOTV_LOGLEVEL is set by the build (LOGLEVEL in the Makefile and
+ * build/build-adapter.sh). Level 0 logs decisions, state changes and
+ * errors. Level 1 adds the per-event trace of every listener, key, pointer
+ * and focus event, several hundred lines per start. */
+#ifndef GECKOTV_LOGLEVEL
+#define GECKOTV_LOGLEVEL 0
+#endif
+#define log_trace(...) \
+    do { \
+        if (GECKOTV_LOGLEVEL >= 1) \
+            log_msg(__VA_ARGS__); \
+    } while (0)
+
 __attribute__((format(printf, 1, 2)))
 static void log_msg(const char *fmt, ...)
 {
@@ -700,7 +713,7 @@ static void emit_popup_configure(struct virt *popup)
     }
     popup->configured = 1;
     emitting = 0;
-    log_msg("popup configure %d,%d %dx%d", popup->popup_x, popup->popup_y,
+    log_trace("popup configure %d,%d %dx%d", popup->popup_x, popup->popup_y,
             popup->p_w, popup->p_h);
 }
 
@@ -750,7 +763,7 @@ static void tag_surface_as(struct wl_proxy *surface, const char *type)
     wl_webos_shell_surface_set_property(ss, "appId", our_app_id());
     wl_webos_shell_surface_set_property(ss, "_WEBOS_WINDOW_TYPE", type);
     wl_webos_shell_surface_set_property(ss, "displayAffinity", "0");
-    log_msg("tagged child surface %p as %s", (void *)surface, type);
+    log_trace("tagged child surface %p as %s", (void *)surface, type);
 }
 
 static void emit_toplevel_configure(struct virt *toplevel)
@@ -797,7 +810,7 @@ static void emit_toplevel_configure(struct virt *toplevel)
     }
     toplevel->configured = 1;
     emitting = 0;
-    log_msg("configure serial %u fullscreen=%d", g.serial, toplevel->fullscreen);
+    log_trace("configure serial %u fullscreen=%d", g.serial, toplevel->fullscreen);
 }
 
 static int flat_mode(void);
@@ -949,7 +962,7 @@ static void text_input_commit(struct virt *v)
     text_input_commits++;
     if (text_input_pending != text_input_enabled) {
         text_input_enabled = text_input_pending;
-        log_msg("text-input %s", text_input_enabled ? "enabled" : "disabled");
+        log_trace("text-input %s", text_input_enabled ? "enabled" : "disabled");
         if (!text_input_enabled)
             hide_keyboard();
         else if (clicked_recently())
@@ -1190,7 +1203,7 @@ static void layered_position(struct wl_proxy *child, int32_t x, int32_t y)
     layered[i].x = x;
     layered[i].y = y;
     if ((x || y) && layered[i].committed) {
-        log_msg("subsurface %p moved to %d,%d: drawn as a pop-up", (void *)child, x, y);
+        log_trace("subsurface %p moved to %d,%d: drawn as a pop-up", (void *)child, x, y);
         detach_slot(i);
         layered[i].surface = NULL;
         ov_popup_at(child, x, y);
@@ -1209,7 +1222,7 @@ static void layered_commit(struct wl_proxy *surface)
     if (layered[i].x || layered[i].y) {
         int32_t x = layered[i].x, y = layered[i].y;
 
-        log_msg("subsurface %p at %d,%d: drawn as a pop-up", (void *)surface, x, y);
+        log_trace("subsurface %p at %d,%d: drawn as a pop-up", (void *)surface, x, y);
         layered[i].surface = NULL;
         ov_popup_at(surface, x, y);
         return;
@@ -2007,7 +2020,7 @@ static void ov_redraw(void)
         static int last_shown = -1;
 
         if (shown != last_shown)
-            log_msg("pop-up overlay: %d surface(s) drawn%s", shown,
+            log_trace("pop-up overlay: %d surface(s) drawn%s", shown,
                     b < 0 ? ", waiting for a free buffer" : "");
         last_shown = shown;
     }
@@ -2121,7 +2134,7 @@ static void ov_child(struct wl_proxy *child, struct wl_proxy *popup)
         ov_update();
     }
     pthread_mutex_unlock(&ov_mu);
-    log_msg("subsurface %p of %p kept for the pop-up overlay", (void *)child, (void *)popup);
+    log_trace("subsurface %p of %p kept for the pop-up overlay", (void *)child, (void *)popup);
 }
 
 static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y)
@@ -2628,7 +2641,7 @@ static void gp_webos_position(void *data, struct wl_webos_shell_surface *ws, int
     struct gp_item *it = data;
 
     (void)ws;
-    log_msg("GPU pop-up %p: position_changed %d,%d (asked %d,%d)", (void *)it->surface, x, y,
+    log_trace("GPU pop-up %p: position_changed %d,%d (asked %d,%d)", (void *)it->surface, x, y,
             it->x + it->off_x, it->y + it->off_y);
     pthread_mutex_lock(&ov_mu);
     it->px = x;
@@ -2990,7 +3003,7 @@ static void ov_commit(struct wl_proxy *surface)
                (b->format == WL_SHM_FORMAT_ARGB8888 || b->format == WL_SHM_FORMAT_XRGB8888) &&
                (size_t)b->offset + (size_t)b->stride * (size_t)b->h <= b->pool->size) {
         if (it->w != b->w || it->h != b->h) {
-            log_msg("pop-up surface %p draws %dx%d", (void *)surface, b->w, b->h);
+            log_trace("pop-up surface %p draws %dx%d", (void *)surface, b->w, b->h);
             free(it->pix);
             it->pix = malloc((size_t)b->w * (size_t)b->h * 4);
             it->w = it->pix ? b->w : 0;
@@ -3330,7 +3343,7 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
             } else if (!our_subcompositor && ov_enabled() && v->wl_surface) {
                 ov_popup_at(v->wl_surface, child->abs_x, child->abs_y);
             }
-            log_msg("popup surface=%p sub=%p at %d,%d %dx%d parent=%p",
+            log_trace("popup surface=%p sub=%p at %d,%d %dx%d parent=%p",
                     (void *)child->wl_surface,
                     (void *)child->subsurface, child->popup_x, child->popup_y,
                     child->p_w, child->p_h, (void *)(parent ? parent->wl_surface : NULL));
@@ -3722,7 +3735,7 @@ static void inject_key(uint32_t code, uint32_t mods)
     uint32_t serial;
 
     if (!to || !to->listener) {
-        log_msg("key %u dropped: no keyboard to type into", code);
+        log_trace("key %u dropped: no keyboard to type into", code);
         return;
     }
     keys = to->listener;
@@ -3745,7 +3758,7 @@ static void inject_text(const char *text)
 
     if (!text)
         return;
-    log_msg("type \"%s\"", text);
+    log_trace("type \"%s\"", text);
     for (p = text; *p; p++) {
         uint32_t code;
         int shift;
@@ -3918,7 +3931,7 @@ static void text_preedit_string(void *data, struct text_model *model, uint32_t s
     (void)model;
     (void)serial;
     /* Not typed. The keyboard sends the text as commit_string when done. */
-    log_msg("preedit %zu chars (commit %zu)", text ? strlen(text) : 0,
+    log_trace("preedit %zu chars (commit %zu)", text ? strlen(text) : 0,
             commit ? strlen(commit) : 0);
 }
 
@@ -4017,7 +4030,7 @@ static void text_keysym(void *data, struct text_model *model, uint32_t serial, u
         return;
     }
     }
-    log_msg("keysym %#x", sym);
+    log_trace("keysym %#x", sym);
 }
 
 static void text_enter(void *data, struct text_model *model, struct wl_surface *surface)
@@ -4031,7 +4044,7 @@ static void text_leave(void *data, struct text_model *model)
 {
     (void)data;
     (void)model;
-    log_msg("text model leave");
+    log_trace("text model leave");
     keyboard_closed();
 }
 
@@ -4143,7 +4156,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         last_y = y >> 8;
         saw_motion = 1;
         note_real_pointer();
-        log_msg("POINTER enter pop-up overlay at %d,%d: pop-up %p", last_x, last_y, (void *)hit);
+        log_trace("POINTER enter pop-up overlay at %d,%d: pop-up %p", last_x, last_y, (void *)hit);
         if (hit && orig && orig->enter)
             orig->enter(data, pointer, serial, hit, x - wl_fixed_from_int(ox),
                         y - wl_fixed_from_int(oy));
@@ -4169,7 +4182,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     saw_motion = 1;
     synth_focus = surface;
     note_real_pointer();
-    log_msg("POINTER enter surface=%p at %d,%d", (void *)surface, last_x, last_y);
+    log_trace("POINTER enter surface=%p at %d,%d", (void *)surface, last_x, last_y);
     if (orig && orig->enter)
         orig->enter(data, pointer, serial, surface, x, y);
 }
@@ -4198,7 +4211,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     }
     if (synth_focus == surface)
         synth_focus = NULL;
-    log_msg("POINTER leave surface=%p", (void *)surface);
+    log_trace("POINTER leave surface=%p", (void *)surface);
     if (orig && orig->leave)
         orig->leave(data, pointer, serial, surface);
 }
@@ -4218,7 +4231,7 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
 
         if (hit != ov_ptr_popup) {
-            log_msg("POINTER on pop-up %p at %d,%d", (void *)hit, last_x, last_y);
+            log_trace("POINTER on pop-up %p at %d,%d", (void *)hit, last_x, last_y);
             if (ov_ptr_popup && orig && orig->leave)
                 orig->leave(data, pointer, ov_ptr_serial, ov_ptr_popup);
             else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
@@ -4250,7 +4263,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
     note_real_pointer();
-    log_msg("click button %u state %u x %d y %d", button, state, last_x, last_y);
+    log_trace("click button %u state %u x %d y %d", button, state, last_x, last_y);
     if (orig && orig->button)
         orig->button(data, pointer, serial, time, button, state);
     /* Address field sits under the tab strip and left of the menu button.
@@ -4301,7 +4314,7 @@ static void deliver_wheel(struct hook *hook, int linux_value, wl_fixed_t fx, wl_
         keys->axis(hook->data, (struct wl_pointer *)hook->proxy, 0, 0, step);
     if (keys->frame)
         keys->frame(hook->data, (struct wl_pointer *)hook->proxy);
-    log_msg("wheel seat %p axis %d frame %d discrete %d v120 %d",
+    log_trace("wheel seat %p axis %d frame %d discrete %d v120 %d",
             hook->proxy, keys->axis != NULL, keys->frame != NULL,
             keys->axis_discrete != NULL, keys->axis_value120 != NULL);
 }
@@ -4341,7 +4354,7 @@ static void focus_and_move(struct hook *hook, struct wl_surface *target,
             keys->enter(hook->data, (struct wl_pointer *)hook->proxy,
                         ++g.serial, target, lx << 8, ly << 8);
         synth_focus = target;
-        log_msg("pointer focus -> %p at %d,%d", (void *)target, lx, ly);
+        log_trace("pointer focus -> %p at %d,%d", (void *)target, lx, ly);
     }
     if (keys->motion)
         keys->motion(hook->data, (struct wl_pointer *)hook->proxy, 0,
@@ -4386,7 +4399,7 @@ static void apply_remote_event(struct ptr_ev ev)
                 break;
             }
         }
-        log_msg("remote wheel %d", ev.down);
+        log_trace("remote wheel %d", ev.down);
         return;
     }
     if (!hook)
@@ -4437,7 +4450,7 @@ static void apply_remote_event(struct ptr_ev ev)
                                        : WL_POINTER_BUTTON_STATE_RELEASED);
         if (keys->frame)
             keys->frame(hook->data, (struct wl_pointer *)hook->proxy);
-        log_msg("remote click %d at %d,%d%s", ev.down, ev.x, ev.y,
+        log_trace("remote click %d at %d,%d%s", ev.down, ev.x, ev.y,
                 target != main_surface ? " (in popup)" : "");
         if (ev.down)
             note_click();
@@ -4700,19 +4713,19 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     focused_keys = hook;
     keyboard_focus_raw = surface;
     surface = input_surface(surface);
-    log_msg("KEYBOARD enter surface=%p", (void *)surface);
+    log_trace("KEYBOARD enter surface=%p", (void *)surface);
     /* LSM treats a popup subsurface as separately focusable and hands it the
      * keyboard. GTK reads that as its toplevel losing focus and deactivates
      * the menu, destroying the popup between the press and the release, so
      * no item ever activates. Keep GTK believing the toplevel still has it. */
     if (is_popup_surface(surface)) {
-        log_msg("  swallowed: popup keyboard focus stays hidden from GTK");
+        log_trace("  swallowed: popup keyboard focus stays hidden from GTK");
         return;
     }
     /* The focus is back after the webOS keyboard had it. GTK never knew. */
     if (hook && hook->held_leave && surface == main_surface) {
         hook->held_leave = 0;
-        log_msg("  swallowed: the held-back leave is cancelled");
+        log_trace("  swallowed: the held-back leave is cancelled");
         return;
     }
     if (orig && orig->enter)
@@ -4728,13 +4741,13 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     if (keyboard_focus_raw == surface)
         keyboard_focus_raw = NULL;
     surface = input_surface(surface);
-    log_msg("KEYBOARD leave surface=%p", (void *)surface);
+    log_trace("KEYBOARD leave surface=%p", (void *)surface);
     if (is_popup_surface(surface)) {
-        log_msg("  swallowed: popup keyboard leave");
+        log_trace("  swallowed: popup keyboard leave");
         return;
     }
     if (surface == main_surface && popup_is_open()) {
-        log_msg("  swallowed: toplevel keeps focus while a menu is open");
+        log_trace("  swallowed: toplevel keeps focus while a menu is open");
         return;
     }
     /* The webOS keyboard is open and has taken the keyboard focus. Passed on,
@@ -4744,7 +4757,7 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     if (hook && surface == main_surface && keyboard_up) {
         hook->held_leave = 1;
         hook->held_serial = serial;
-        log_msg("  held back: the webOS keyboard has the focus while it is open");
+        log_trace("  held back: the webOS keyboard has the focus while it is open");
         return;
     }
     if (focused_keys == hook)
@@ -4767,7 +4780,7 @@ static void keyboard_closed(void)
         if (!hook->held_leave)
             continue;
         hook->held_leave = 0;
-        log_msg("keyboard leave passed on after the webOS keyboard closed");
+        log_trace("keyboard leave passed on after the webOS keyboard closed");
         if (focused_keys == hook)
             focused_keys = NULL;
         if (orig && orig->leave)
@@ -4903,7 +4916,7 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
-        log_msg("key %u", key);
+        log_trace("key %u", key);
     /* 158 Back, 174 Exit. 1198/1199 are the wheel's cursor-show/hide keys. */
     if (key == 158 || key == 174 || key == 1198 || key == 1199) {
         if (key == 158 && state == WL_KEYBOARD_KEY_STATE_PRESSED)
@@ -5012,7 +5025,7 @@ void webos_xdg_prepare_listener(struct wl_proxy *proxy, void (***implementation)
     }
     name = iface ? iface->name : "";
     v = virt_get(proxy);
-    log_msg("listener %s", name);
+    log_trace("listener %s", name);
     if (!strcmp(name, "wl_pointer") || !strcmp(name, "wl_keyboard")) {
         struct hook *hook = hook_slot(!strcmp(name, "wl_pointer") ? pointer_hooks : keyboard_hooks,
                                       proxy);
@@ -5028,7 +5041,7 @@ void webos_xdg_prepare_listener(struct wl_proxy *proxy, void (***implementation)
                 where_is(kl && kl->key ? (const void *)kl->key : NULL, at, sizeof at);
                 if (strstr(at, "libgdk"))
                     gdk_keys = hook;
-                log_msg("  wl_keyboard %u, key handler in %s", wl_proxy_get_id(proxy), at);
+                log_trace("  wl_keyboard %u, key handler in %s", wl_proxy_get_id(proxy), at);
             }
             if (!strcmp(name, "wl_keyboard") && !focused_keys)
                 focused_keys = hook;
@@ -5090,7 +5103,7 @@ static void cursor_surface_add(struct wl_proxy *surface)
     for (i = 0; i < MAX_CURSOR; i++) {
         if (!cursor_surfaces[i]) {
             cursor_surfaces[i] = surface;
-            log_msg("cursor surface %p: its content stays client-side", (void *)surface);
+            log_trace("cursor surface %p: its content stays client-side", (void *)surface);
             return;
         }
     }
@@ -5120,7 +5133,7 @@ static int cursor_surface_request(struct wl_proxy *surface, uint32_t opcode)
     case WL_SURFACE_OFFSET:
         if (dropped < 8) {
             dropped++;
-            log_msg("dropped cursor surface request %u", opcode);
+            log_trace("dropped cursor surface request %u", opcode);
         }
         return 1;
     default:
@@ -5273,7 +5286,7 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
         static int once;
         if (!once) {
             once = 1;
-            log_msg("translate damage_buffer");
+            log_trace("translate damage_buffer");
         }
         wl_proxy_marshal(proxy, WL_SURFACE_DAMAGE,
                          args[0].i, args[1].i, args[2].i, args[3].i);
@@ -5291,7 +5304,7 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     v = virt_get(proxy);
     if (!v || v->kind == 0)
         return 0;
-    log_msg("virt kind %d opcode %u", v->kind, opcode);
+    log_trace("virt kind %d opcode %u", v->kind, opcode);
     *out = virt_request(v, opcode, flags, interface, args);
     return 1;
 }

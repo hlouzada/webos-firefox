@@ -1005,38 +1005,54 @@ untyped ones became cards and `_WEBOS_WINDOW_TYPE_SYSTEM_UI` was positioned
 by the compositor. `wl_webos_foreign` can also attach a surface into an
 exported region of the window, which is under test.
 
-**Pop-ups over a GPU window (round 17, 2026-11-16).** `wl_webos_foreign`
-does it: `export_element(window, type)` on the window, `set_exported_window`
-with the pop-up's rectangle as source and destination, `import_element`
-with the assigned id, `attach_surface(popup surface)`. The compositor drew
-a 480x270 shared-memory surface exactly in the exported region, above the
-window, for the types transparent_object (2), opaque_object (3) and
-video_object (0), with and without `set_z_index`, while the window kept
-drawing. A full-screen transparent surface typed SYSTEM_UI, OVERLAY or
-FLOATING was drawn too, but where the compositor chose (top left) and the
-SYSTEM_UI one minimized the window when it went away, as a POPUP-typed
-surface did in round 14; untyped second surfaces become cards. No pointer
-event reached the probe (started from a root shell, not by the app
-manager), so which surface gets the pointer over an attached pop-up is
-still to be seen with Firefox itself.
+**Pop-ups over a GPU window (rounds 17 to 22, 2026-11-16 and 17).**
+Round 17 was read wrongly. Its log showed every request answered. Window
+ids were assigned, surfaces attached and the window still drawing, and this
+file said the compositor drew the attached surfaces and the overlays. The
+tester had seen none of them. Rounds 18 to 22 ran on the same TV on
+2026-11-17 with the tester watching while the log was read, and they settle
+what the compositor does.
 
-**GL window mode (0.1.40).** With the TV's wayland-egl library and the
-adapter's GL window mode (`WEBOS_XDG_GL=1`, set by the launcher on a
-flat-mode compositor that has `libwayland-egl.so.1` or `.so.0`), Firefox
-renders with GPU WebRender on this TV at 1920x1080: Firefox's content
-subsurface gets the wl_shell toplevel and the app's webOS properties and
-its requests pass through (`gl_window_set`); GTK's window surface is
-tagged, never shown, its frames answered and buffers released as in flat
-mode but without copying; each pop-up's content surface is attached into a
-region of the window exported through `wl_webos_foreign` at the pop-up's
-place (`gl_popup_place`, `gl_attach_maybe`), and pointer events on the
-window are hit-tested against those regions (`gl_hit`). The first run on
-the tester's TV (2026-11-16) drew the page, took clicks, and showed the
-hamburger menu three times (attached at 1606,76 as 310x645, gone on
-close); the tester's verdict was "everything seems to work". Hardware
-video is off in this mode: the key-colour hole needs the adapter to
-compose the window. A second GTK toplevel still gets a card of its own, as
-before.
+- A surface imported into an exported region of the window is never drawn,
+  not even where the window is transparent, and an alpha 0 hole shows
+  black. That holds for `wl_webos_foreign` exports and imports as
+  transparent_object, opaque_object or video_object, with or without a
+  video_object export beside it, created before or after it. The compositor
+  offers `wl_webos_foreign` v1 only, so `set_z_index` and `set_property`
+  are not available. Firefox 0.1.40 to 0.1.44 attached every menu this way,
+  which is why the log showed menus opening while nothing appeared.
+- A second toplevel of the app with the app's properties and
+  `_WEBOS_WINDOW_TYPE` OVERLAY or FLOATING is drawn over the card and
+  blended. A full-screen transparent one shows the window beneath it still
+  drawing. SYSTEM_UI is not drawn. A surface smaller than the screen lands
+  at the top left wherever it asked to be. The moment such a surface is
+  destroyed the compositor minimizes the card with `state_changed` 1, for
+  every type and for full-screen and small surfaces alike. Mapping one does
+  not minimize it.
+- A process started from a root shell gets no pointer events on any of its
+  surfaces, so input routing can only be tested inside Firefox.
+
+**GL window mode (0.1.40, pop-ups 0.1.45).** With the TV's wayland-egl
+library and the adapter's GL window mode, Firefox renders with GPU
+WebRender on this TV at 1920x1080. The launcher sets `WEBOS_XDG_GL=1` on a
+flat-mode compositor that has `libwayland-egl.so.1` or `.so.0`. Firefox's
+content subsurface gets the wl_shell toplevel and the app's webOS
+properties and its requests pass through in `gl_window_set`. GTK's window
+surface is tagged and never shown, its frames are answered and its buffers
+released as in flat mode but without copying. Pop-ups are copied into one
+full-screen transparent surface of the app typed OVERLAY, made by
+`ov_ensure` once the GL window is shown and kept until Firefox exits,
+since destroying it would minimize the card. Firefox draws menus and
+panels in software because a pop-up without remote content gets no
+accelerated widget, so their buffers are shared memory and the flat-mode
+copy applies. The overlay's input region is empty, so pointer events
+arrive on the GL window and `ov_hit` sends them to the pop-up under them
+by rectangle. Mapping the overlay moves the keyboard focus to it and back,
+and the adapter reports both as GTK's window. On the tester's TV on
+2026-11-17 the hamburger menu, extensions, account, tab list and site
+identity pop-ups and tooltips were verified to draw and work, also while a
+YouTube video plays on the hardware plane (section 21). A second GTK
+toplevel still gets a card of its own as before.
 
 **The keyboard crash (0.1.28).** On that TV Firefox closed whenever a text
 field lost focus (Wikipedia's search box, the address bar, other pages):

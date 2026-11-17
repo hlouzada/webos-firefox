@@ -1812,3 +1812,40 @@ The three cases are these.
   the previous page.
 
 `tests/adapter/back-key.c` checks the three cases on the host.
+
+---
+
+## 25. Fixed: one wheel notch scrolled six times too far, and the page was too small
+
+A Magic Remote notch reaches GTK as the adapter's own `wl_pointer.axis`
+event (section 3c), and the adapter sent an axis value of 60 per notch. GTK
+3.24 divides the axis value by 10 to get one wheel tick
+(`gdkdevice-wayland.c`, `pointer_handle_axis`). It also emits a discrete
+`GDK_SCROLL_UP/DOWN` event marked as pointer-emulated, and Firefox's
+smooth-scroll mask drops that one. Firefox turns the smooth event's delta
+into three lines per tick (`widget/gtk/nsWindow.cpp`, `GDK_SCROLL_SMOOTH`).
+So a notch was 18 lines, and 36 on the root scroll frame where the 200 %
+system scroll override applies, against 3 and 6 for a desktop mouse. The
+adapter now sends 10 per notch. `tests/adapter/wheel.c` checks the axis,
+discrete and value120 values on the host.
+
+`00-webos.js` sets `layout.css.devPixelsPerPx` to 1.5, so the 1920x1080
+window lays pages out at 1280x720 CSS pixels and the toolbar scales with
+them. It also takes Betterfox's Smoothfox "sharpen scrolling" option. That
+is the one written for 60 Hz displays, with a 10 px minimum line, 80 ms
+minimum wheel animation, velocity weighting 0.15 and deceleration
+weighting 0.6. The other Smoothfox options raise
+`mousewheel.default.delta_multiplier_y` to 200 or 300. That is the opposite
+of what the wheel needed. Read back over Marionette on the TV with 0.1.48,
+`devicePixelRatio` is 1.5, the window 1280x720, the content viewport
+1280x588, all four scroll prefs as set and the GPU path unchanged.
+
+**Marionette from this machine.** `touch <app dir>/marionette`, launch,
+wait about 40 s, `ssh -f -N -L 2828:127.0.0.1:2828`, then a client that
+speaks protocol 3 over the socket (`WebDriver:NewSession`,
+`Marionette:SetContext` chrome, `WebDriver:ExecuteScript` with
+`Services.prefs`). Remove the marker afterwards. There are two traps.
+`pkill -f` with a pattern that appears in the calling shell's own command
+line kills that shell, on the host and on the TV alike. End Firefox by
+scanning `/proc/*/cmdline` for an `argv[0]` ending in
+`firefox-runtime/firefox`.

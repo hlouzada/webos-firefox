@@ -253,6 +253,24 @@ pref("browser.download.manager.addToRecentDocs", false);
 pref("browser.download.open_pdf_attachments_inline", true);
 pref("browser.bookmarks.openInTabClosesMenu", false);
 
+// Recording that stays on with uploads off and that nothing on a TV reads.
+// Page-interaction rows in places.sqlite, the blocked-tracker database and
+// its milestone prompt, search-page classification, the captcha-detection
+// actor in every page, the Reporting API (sites' own error reports) and
+// Glean's start at shutdown.
+pref("browser.places.interactions.enabled", false);
+pref("browser.contentblocking.database.enabled", false);
+pref("browser.contentblocking.cfr-milestone.enabled", false);
+pref("browser.search.serpEventTelemetryCategorization.enabled", false);
+pref("captchadetection.actor.enabled", false);
+pref("dom.reporting.enabled", false);
+pref("dom.reporting.header.enabled", false);
+pref("telemetry.fog.init_on_shutdown", false);
+pref("browser.newtabpage.activity-stream.telemetry.privatePing.enabled", false);
+pref("browser.newtabpage.activity-stream.discoverystream.reportAds.enabled", false);
+pref("identity.fxaccounts.telemetry.clientAssociationPing.enabled", false);
+pref("browser.crashReports.cleanupCheck.enabled", false);
+
 // Housekeeping.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);

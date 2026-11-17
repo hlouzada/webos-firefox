@@ -93,6 +93,85 @@ pref("media.webos.engine.enabled", true);
 // has run on the defaults. Forcing software rendering on a TV SoC is a
 // large regression, so those lines are gone rather than merely flipped.
 
+// Background services. Each of these contacts Mozilla's servers on a timer
+// and keeps data on disk, and none of them has a job on a TV. Left on they
+// poll 40 remote-settings collections, download Safe Browsing lists, fetch
+// sponsored top sites and update CRLite filters at every start. Remote
+// settings keeps polling once a week so the certificate blocklist (OneCRL)
+// and the preloaded intermediates stay current.
+pref("services.settings.poll_interval", 604800);
+pref("security.remote_settings.crlite_filters.enabled", false);
+pref("security.pki.crlite_mode", 0);
+pref("app.normandy.enabled", false);
+pref("app.shield.optoutstudies.enabled", false);
+pref("browser.newtabpage.activity-stream.asrouter.providers.cfr", "{\"id\":\"cfr\",\"enabled\":false,\"type\":\"remote-settings\",\"collection\":\"cfr\",\"updateCycleInMs\":3600000}");
+pref("browser.newtabpage.activity-stream.asrouter.providers.message-groups", "{\"id\":\"message-groups\",\"enabled\":false,\"type\":\"remote-settings\",\"collection\":\"message-groups\",\"updateCycleInMs\":3600000}");
+pref("browser.newtabpage.activity-stream.asrouter.providers.messaging-experiments", "{\"id\":\"messaging-experiments\",\"enabled\":false,\"type\":\"remote-experiments\",\"updateCycleInMs\":3600000}");
+pref("browser.newtabpage.activity-stream.feeds.topsites", false);
+pref("browser.newtabpage.activity-stream.feeds.system.topsites", false);
+pref("browser.newtabpage.activity-stream.feeds.section.topstories", false);
+pref("browser.newtabpage.activity-stream.discoverystream.enabled", false);
+pref("browser.newtabpage.activity-stream.unifiedAds.tiles.enabled", false);
+pref("browser.newtabpage.activity-stream.telemetry", false);
+pref("browser.topsites.contile.enabled", false);
+pref("browser.safebrowsing.malware.enabled", false);
+pref("browser.safebrowsing.phishing.enabled", false);
+pref("browser.safebrowsing.blockedURIs.enabled", false);
+pref("browser.safebrowsing.downloads.enabled", false);
+pref("browser.safebrowsing.downloads.remote.enabled", false);
+pref("browser.safebrowsing.provider.google.updateURL", "");
+pref("browser.safebrowsing.provider.google.gethashURL", "");
+pref("browser.safebrowsing.provider.google4.updateURL", "");
+pref("browser.safebrowsing.provider.google4.gethashURL", "");
+pref("datareporting.healthreport.uploadEnabled", false);
+pref("identity.fxaccounts.enabled", false);
+pref("browser.ipProtection.enabled", false);
+pref("browser.ml.enable", false);
+pref("browser.ml.chat.enabled", false);
+pref("browser.ml.linkPreview.enabled", false);
+pref("browser.translations.enable", false);
+pref("browser.translations.automaticallyPopup", false);
+pref("network.captive-portal-service.enabled", false);
+pref("network.connectivity-service.enabled", false);
+pref("network.trr.mode", 5);
+pref("dom.push.enabled", false);
+pref("dom.push.connection.enabled", false);
+pref("media.gmp-manager.updateEnabled", false);
+pref("media.gmp-provider.enabled", false);
+pref("media.gmp-gmpopenh264.enabled", false);
+pref("browser.search.update", false);
+pref("browser.search.suggest.enabled", false);
+pref("browser.urlbar.suggest.searches", false);
+pref("browser.urlbar.quicksuggest.enabled", false);
+pref("browser.urlbar.suggest.quicksuggest.sponsored", false);
+pref("browser.urlbar.suggest.quicksuggest.nonsponsored", false);
+pref("browser.urlbar.suggest.trending", false);
+pref("browser.urlbar.trending.featureGate", false);
+pref("browser.urlbar.addons.featureGate", false);
+pref("browser.urlbar.suggest.weather", false);
+pref("browser.urlbar.speculativeConnect.enabled", false);
+pref("browser.places.speculativeConnect.enabled", false);
+pref("network.prefetch-next", false);
+pref("network.dns.disablePrefetch", true);
+pref("extensions.formautofill.addresses.enabled", false);
+pref("extensions.formautofill.creditCards.enabled", false);
+pref("extensions.getAddons.cache.enabled", false);
+pref("extensions.update.enabled", false);
+pref("extensions.systemAddon.update.enabled", false);
+pref("browser.region.update.enabled", false);
+pref("browser.region.network.url", "");
+pref("screenshots.browser.component.enabled", false);
+pref("browser.backup.enabled", false);
+pref("layout.spellcheckDefault", 0);
+// The app manager ends Firefox with SIGTERM whenever the card leaves the
+// foreground. Early in a start that counts as a start-up crash, and after
+// three of them Firefox stops at the Safe Mode prompt. A remote cannot
+// answer that prompt. -1 turns it off.
+pref("toolkit.startup.max_resumed_crashes", -1);
+// Session state is written every 15 s by default. One page at a time on
+// flash storage does not need that.
+pref("browser.sessionstore.interval", 120000);
+
 // Housekeeping.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);

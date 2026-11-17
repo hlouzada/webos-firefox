@@ -4045,6 +4045,16 @@ static void apply_remote_event(struct ptr_ev ev)
         int lx = over ? ev.x - over->abs_x : ev.x;
         int ly = over ? ev.y - over->abs_y : ev.y;
 
+        if (!over && ov_enabled()) {
+            int32_t ox = 0, oy = 0;
+            struct wl_surface *hit = ov_hit(ev.x, ev.y, &ox, &oy);
+
+            if (hit) {
+                target = hit;
+                lx = ev.x - ox;
+                ly = ev.y - oy;
+            }
+        }
         focus_and_move(hook, target, lx, ly);
         if (ev.button < 0 || !keys->button)
             return;
@@ -4054,11 +4064,11 @@ static void apply_remote_event(struct ptr_ev ev)
         if (keys->frame)
             keys->frame(hook->data, (struct wl_pointer *)hook->proxy);
         log_msg("remote click %d at %d,%d%s", ev.down, ev.x, ev.y,
-                over ? " (in popup)" : "");
+                target != main_surface ? " (in popup)" : "");
         if (ev.down)
             note_click();
         /* A click inside a menu must not open or close the keyboard. */
-        if (!text_input_bound && ev.down && !over) {
+        if (!text_input_bound && ev.down && target == main_surface) {
             if (ev.y >= 30 && ev.y < 110 && ev.x < 1700)
                 show_keyboard();
             else

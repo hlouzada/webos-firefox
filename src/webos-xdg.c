@@ -11,8 +11,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <ucontext.h>
@@ -1308,6 +1310,258 @@ static int ov_flat_test(void)
 }
 static uint32_t *ov_canvas;
 static int32_t ov_w, ov_h;
+
+/* Hardware video in GL window mode. LG's media pipeline is fed by
+ * geckotv --media-helper for Firefox's webOS media engine. It shows the
+ * picture on a plane under the graphics, inside a region of the window
+ * exported through wl_webos_foreign. Firefox clears the window to alpha 0
+ * where the video is, so the plane shows through. The engine runs in
+ * Firefox's content process. It connects on the unix socket
+ * GECKOTV_VIDEO_SOCKET, gets "windowid <id>" and sends "rect x y w h vw vh"
+ * with the video's place in window pixels and its natural size. The
+ * destination region is the rect clipped to the window and the source
+ * region is the matching part of the natural video. "rect 0 0 0 0 0 0" or
+ * a closed socket clears the region. */
+static struct wl_webos_exported *video_exported;
+static char video_window_id[128];
+static int video_listen_fd = -1;
+static int video_client_fd = -1;
+static int video_id_unsent;        /* window id to send under ov_mu */
+static int32_t video_rect[4];      /* the last region set as x y w h, all 0 for none */
+static char video_line[256];
+static size_t video_line_len;
+
+static struct wl_webos_foreign *gl_foreign_get(void);
+static struct wl_compositor *gl_compositor_get(void);
+static struct wl_proxy *gl_window;  /* defined with the GL window state below */
+
+/* The regions for a video of vw x vh shown at rect, given as x y w h in
+ * window pixels. dst is rect clipped to the win_w x win_h window and src is
+ * the part of the video that lands in it. Returns 0 when nothing of it is
+ * visible. */
+static int video_clip(const int32_t rect[4], int32_t vw, int32_t vh, int32_t src[4],
+                      int32_t dst[4])
+{
+    int32_t x0 = rect[0], y0 = rect[1], x1 = rect[0] + rect[2], y1 = rect[1] + rect[3];
+
+    if (rect[2] <= 0 || rect[3] <= 0 || vw <= 0 || vh <= 0)
+        return 0;
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > win_w)
+        x1 = win_w;
+    if (y1 > win_h)
+        y1 = win_h;
+    if (x1 <= x0 || y1 <= y0)
+        return 0;
+    dst[0] = x0;
+    dst[1] = y0;
+    dst[2] = x1 - x0;
+    dst[3] = y1 - y0;
+    src[0] = (int32_t)((int64_t)(x0 - rect[0]) * vw / rect[2]);
+    src[1] = (int32_t)((int64_t)(y0 - rect[1]) * vh / rect[3]);
+    src[2] = (int32_t)((int64_t)(x1 - rect[0]) * vw / rect[2]) - src[0];
+    src[3] = (int32_t)((int64_t)(y1 - rect[1]) * vh / rect[3]) - src[1];
+    if (src[2] < 1)
+        src[2] = 1;
+    if (src[3] < 1)
+        src[3] = 1;
+    return 1;
+}
+
+/* Under ov_mu. */
+static void video_region_set(const int32_t rect[4], int32_t vw, int32_t vh)
+{
+    int32_t src[4], dst[4] = { 0, 0, 0, 0 };
+    struct wl_region *source, *destination;
+
+    if (!video_exported || !gl_compositor_get())
+        return;
+    if (!video_clip(rect, vw, vh, src, dst))
+        memset(dst, 0, sizeof dst);
+    if (!memcmp(dst, video_rect, sizeof dst) && dst[2] == 0)
+        return;
+    memcpy(video_rect, dst, sizeof video_rect);
+    source = wl_compositor_create_region(gl_compositor_get());
+    destination = wl_compositor_create_region(gl_compositor_get());
+    if (dst[2] > 0) {
+        wl_region_add(source, src[0], src[1], src[2], src[3]);
+        wl_region_add(destination, dst[0], dst[1], dst[2], dst[3]);
+    }
+    wl_webos_exported_set_exported_window(video_exported, source, destination);
+    wl_region_destroy(source);
+    wl_region_destroy(destination);
+    if (dst[2] > 0)
+        log_msg("video plane at %d,%d %dx%d (source %d,%d %dx%d of %dx%d)", dst[0], dst[1],
+                dst[2], dst[3], src[0], src[1], src[2], src[3], vw, vh);
+    else
+        log_msg("video plane hidden");
+}
+
+static void video_client_gone(const char *why)
+{
+    static const int32_t none[4] = { 0, 0, 0, 0 };
+
+    if (video_client_fd < 0)
+        return;
+    log_msg("video client gone (%s)", why);
+    close(video_client_fd);
+    video_client_fd = -1;
+    video_line_len = 0;
+    video_region_set(none, 0, 0);
+}
+
+static void video_send(const char *line)
+{
+    if (video_client_fd < 0)
+        return;
+    if (send(video_client_fd, line, strlen(line), MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
+        errno != EAGAIN)
+        video_client_gone(strerror(errno));
+}
+
+static void video_send_window_id(void)
+{
+    char line[160];
+
+    if (!video_window_id[0])
+        return;
+    snprintf(line, sizeof line, "windowid %s\n", video_window_id);
+    video_send(line);
+}
+
+/* Runs on the thread dispatching Wayland events. The socket is used only
+ * under ov_mu, so the id is sent from there. */
+static void video_window_id_assigned(void *data, struct wl_webos_exported *exported,
+                                     const char *id, uint32_t type)
+{
+    (void)data;
+    (void)exported;
+    pthread_mutex_lock(&ov_mu);
+    snprintf(video_window_id, sizeof video_window_id, "%s", id ? id : "");
+    video_id_unsent = 1;
+    pthread_mutex_unlock(&ov_mu);
+    log_msg("video window exported as %s (type %u)", video_window_id, type);
+}
+
+static const struct wl_webos_exported_listener video_exported_listener = {
+    video_window_id_assigned
+};
+
+static void video_socket_ensure(void)
+{
+    const char *path = getenv("GECKOTV_VIDEO_SOCKET");
+    struct sockaddr_un addr;
+    mode_t old;
+
+    if (video_listen_fd >= 0 || !path || !path[0] || strlen(path) >= sizeof addr.sun_path)
+        return;
+    video_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (video_listen_fd < 0)
+        return;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    unlink(path);
+    old = umask(077);
+    if (bind(video_listen_fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(video_listen_fd, 1) != 0) {
+        log_msg("video socket %s: %s", path, strerror(errno));
+        close(video_listen_fd);
+        video_listen_fd = -1;
+    } else {
+        log_msg("video socket %s", path);
+    }
+    umask(old);
+}
+
+/* Under ov_mu, once the GL window exists. */
+static void video_export_ensure(void)
+{
+    if (video_exported || !gl_window || !getenv("GECKOTV_VIDEO_SOCKET") || !gl_foreign_get())
+        return;
+    video_exported = wl_webos_foreign_export_element(
+        gl_foreign_get(), (struct wl_surface *)gl_window,
+        WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
+    wl_webos_exported_add_listener(video_exported, &video_exported_listener, NULL);
+}
+
+/* "rect x y w h vw vh" from the client. */
+static void video_client_line(char *line)
+{
+    int32_t v[6];
+
+    if (sscanf(line, "rect %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6)
+        video_region_set(v, v[4], v[5]);
+    else
+        log_msg("video client said: %s", line);
+}
+
+static void video_client_read(void)
+{
+    ssize_t n;
+    char *start, *nl;
+
+    n = recv(video_client_fd, video_line + video_line_len,
+             sizeof video_line - 1 - video_line_len, MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+        video_client_gone("closed");
+        return;
+    }
+    if (n < 0)
+        return;
+    video_line_len += (size_t)n;
+    video_line[video_line_len] = '\0';
+    start = video_line;
+    while ((nl = strchr(start, '\n')) != NULL) {
+        *nl = '\0';
+        video_client_line(start);
+        start = nl + 1;
+    }
+    video_line_len = strlen(start);
+    memmove(video_line, start, video_line_len + 1);
+    if (video_line_len == sizeof video_line - 1)
+        video_line_len = 0;
+}
+
+/* One client at a time, and only one started by this user. A client that
+ * went away makes room for the next one at once. Called every 20 ms under
+ * ov_mu from flat_pump. */
+static void video_accept(void)
+{
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+    int fd;
+
+    if (video_listen_fd < 0)
+        return;
+    if (video_client_fd >= 0) {
+        struct pollfd p = { video_client_fd, POLLIN, 0 };
+
+        if (poll(&p, 1, 0) > 0)
+            video_client_read();
+    }
+    fd = accept4(video_listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0) {
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != getuid()) {
+            log_msg("video socket: refused a connection from uid %u", (unsigned)cred.uid);
+            close(fd);
+        } else if (video_client_fd >= 0) {
+            log_msg("video socket: a second client refused");
+            close(fd);
+        } else {
+            video_client_fd = fd;
+            log_msg("video client connected (pid %d)", (int)cred.pid);
+            video_id_unsent = 1;
+        }
+    }
+    if (video_client_fd >= 0 && video_id_unsent && video_window_id[0]) {
+        video_id_unsent = 0;
+        video_send_window_id();
+    }
+}
 static int ov_failed;
 /* Pointer: the pop-up GTK is told the pointer is in, while it is on the overlay. */
 static int ov_ptr_on;
@@ -1578,6 +1832,7 @@ static int ov_ensure(void)
         /* The window itself: map_toplevel gives it the window's roles. */
         ov_shown = 1;
         log_msg("flat window %p, %dx%d", (void *)ov_surface, ov_w, ov_h);
+        video_socket_ensure();
         return 1;
     }
     tag_surface_as((struct wl_proxy *)ov_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
@@ -2036,7 +2291,8 @@ static void *flat_pump(void *unused)
     for (;;) {
         usleep(20 * 1000);
         pthread_mutex_lock(&ov_mu);
-            if ((ov_dirty || ov_flat_test()) && ov_surface)
+        video_accept();
+        if ((ov_dirty || ov_flat_test()) && ov_surface)
             ov_update();
         flat_answer_maybe();
         if (getenv("WEBOS_XDG_OV_DEBUG") && now_ms() - reported >= 5000) {
@@ -2291,6 +2547,8 @@ static void gl_window_set(struct wl_proxy *child)
                                                 "true");
             wl_webos_shell_surface_set_key_mask(gl_webos, 0xFFFFFFFAu);
             wl_webos_shell_surface_set_property(gl_webos, "_WEBOS_CURSOR_SLEEP_TIME", "-1");
+            video_socket_ensure();
+            video_export_ensure();
             wl_webos_shell_surface_set_state(gl_webos, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
         }
     }

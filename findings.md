@@ -1780,3 +1780,35 @@ console lines and no callback trace. What remains is the compositor
 inventory printed once per Firefox process (six or seven times), the
 graphics annotations that Firefox writes to stderr regardless of prefs, and
 xkbcommon's keymap errors. The log file itself still grows without bound.
+
+---
+
+## 24. Fixed: the remote's Back key did nothing but close the keyboard
+
+The compositor delivers Back to the app as a wl_keyboard key. The key is
+412 (`KEY_PREVIOUS`) on webOS 6.5 and 158 (`KEY_BACK`) on the TVs the
+adapter was first written against. The level 1 log shows the former as
+`key 412`. The adapter dropped 158 after closing the webOS keyboard and
+passed 412 on untouched. GTK's keymap has no symbol for 412, so Firefox
+never saw a Back press either way. Both are now Back and are passed on as
+one of three keys chosen at the press. The release follows the same choice.
+The three cases are these.
+
+- While the webOS keyboard is up, the adapter closes it and passes nothing.
+  The same press also arrives through evdev. That path works while the IME
+  panel holds the Wayland focus. Whichever path comes first closes the
+  keyboard, and the other does nothing more for half a second.
+- While a menu is open, or Firefox has asked for a fullscreen window, the
+  key is `KEY_ESC`. The fullscreen API asks for such a window when a page
+  makes a video fullscreen. Firefox closes the menu or leaves fullscreen as
+  it does on a desktop.
+- Otherwise the key is `KEY_BACK` itself. GTK on the TV runs its default US
+  keymap and logs `Got invalid keymap from compositor, keeping
+  previous/default one`. LG's keymap has keycodes above 0xfff and unnamed
+  symbols, so the adapter's filter does not apply and xkbcommon refuses it.
+  The default keymap is built from the bundled `firefox-runtime/xkb` data
+  with the evdev rules, and there keycode 166 is `XF86Back`. Firefox's GTK
+  port turns `XF86Back` into the `Back` app command, and that command is
+  the previous page.
+
+`tests/adapter/back-key.c` checks the three cases on the host.

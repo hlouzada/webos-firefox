@@ -14,6 +14,9 @@ pref("dom.ipc.processCount.webIsolated", 1);
 pref("fission.autostart", false);
 pref("browser.sessionhistory.max_total_viewers", 0);
 pref("browser.cache.memory.capacity", 32768);
+// 100 MB disk cache. Smart sizing would grow it with free flash.
+pref("browser.cache.disk.smart_size.enabled", false);
+pref("browser.cache.disk.capacity", 102400);
 pref("image.mem.surfacecache.max_size_kb", 32768);
 pref("webgl.disabled", true);
 // Media Source buffers are the largest single allocation on a video site.

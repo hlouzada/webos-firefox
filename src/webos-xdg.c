@@ -4317,7 +4317,9 @@ static void deliver_wheel(struct hook *hook, int linux_value, wl_fixed_t fx, wl_
 {
     const struct wl_pointer_listener *keys = hook->listener;
     int notch = linux_value > 0 ? -1 : 1;
-    wl_fixed_t step = (wl_fixed_t)(notch * 60) << 8;
+    /* 10 per notch because GTK divides the axis value by 10 to get one wheel
+     * tick, and Firefox scrolls three lines per tick as for a desktop mouse. */
+    wl_fixed_t step = wl_fixed_from_int(notch * 10);
 
     if (!keys)
         return;

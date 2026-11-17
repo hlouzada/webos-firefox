@@ -985,6 +985,61 @@ in a video while the toolbar and the address bar's drop-down drew; the app
 was killed for lack of memory about 3 s after the drop-down opened; and the
 tester saw flicker while scrolling the settings.
 
+**GPU rendering on this TV (2026-11-16).** The Mali driver never drew
+because of the wayland-egl library, not because of the compositor. webOS
+6.5 ships `/usr/lib/libwayland-egl.so.0` and no `.so.1`. The launcher and
+the GPU probe looked for `.so.1` only and loaded the bundled stand-in, and
+Mali is itself linked against the TV's `.so.0`, so it blocks in the first
+`eglSwapBuffers` on a window made by another library and sends no Wayland
+request at all. With the TV's library the probe renders 180 frames of
+1920x1080 on a window of its own in 3.6 s on the legacy and the platform
+display alike, and that time includes a 16 ms pause per frame. The
+launcher now links `libwayland-egl.so.1` to the TV's `.so.0` in the
+profile folder. Two more facts came out of the same rounds. A surface's
+`wl_surface.frame` request must reach the compositor, which answers it on
+that surface. The adapter's flat-mode virtual callbacks land on the default
+queue while Mali waits on its own queue. And a wl_shell toplevel with the
+app's webOS properties becomes the card directly. So the GPU path on this
+TV needs Firefox's GL content surface to be the window and not a copied
+subsurface. The pop-ups then need a surface the compositor shows above the
+card. In round 14 a `_WEBOS_WINDOW_TYPE_POPUP` surface minimized the card,
+untyped ones became cards and `_WEBOS_WINDOW_TYPE_SYSTEM_UI` was positioned
+by the compositor. `wl_webos_foreign` can also attach a surface into an
+exported region of the window, which is under test.
+
+**Pop-ups over a GPU window (round 17, 2026-11-16).** `wl_webos_foreign`
+does it: `export_element(window, type)` on the window, `set_exported_window`
+with the pop-up's rectangle as source and destination, `import_element`
+with the assigned id, `attach_surface(popup surface)`. The compositor drew
+a 480x270 shared-memory surface exactly in the exported region, above the
+window, for the types transparent_object (2), opaque_object (3) and
+video_object (0), with and without `set_z_index`, while the window kept
+drawing. A full-screen transparent surface typed SYSTEM_UI, OVERLAY or
+FLOATING was drawn too, but where the compositor chose (top left) and the
+SYSTEM_UI one minimized the window when it went away, as a POPUP-typed
+surface did in round 14; untyped second surfaces become cards. No pointer
+event reached the probe (started from a root shell, not by the app
+manager), so which surface gets the pointer over an attached pop-up is
+still to be seen with Firefox itself.
+
+**GL window mode (0.1.40).** With the TV's wayland-egl library and the
+adapter's GL window mode (`WEBOS_XDG_GL=1`, set by the launcher on a
+flat-mode compositor that has `libwayland-egl.so.1` or `.so.0`), Firefox
+renders with GPU WebRender on this TV at 1920x1080: Firefox's content
+subsurface gets the wl_shell toplevel and the app's webOS properties and
+its requests pass through (`gl_window_set`); GTK's window surface is
+tagged, never shown, its frames answered and buffers released as in flat
+mode but without copying; each pop-up's content surface is attached into a
+region of the window exported through `wl_webos_foreign` at the pop-up's
+place (`gl_popup_place`, `gl_attach_maybe`), and pointer events on the
+window are hit-tested against those regions (`gl_hit`). The first run on
+the tester's TV (2026-11-16) drew the page, took clicks, and showed the
+hamburger menu three times (attached at 1606,76 as 310x645, gone on
+close); the tester's verdict was "everything seems to work". Hardware
+video is off in this mode: the key-colour hole needs the adapter to
+compose the window. A second GTK toplevel still gets a card of its own, as
+before.
+
 **The keyboard crash (0.1.28).** On that TV Firefox closed whenever a text
 field lost focus (Wikipedia's search box, the address bar, other pages):
 `invalid arguments for text_model@NN.set_max_text_length`, then

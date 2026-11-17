@@ -682,7 +682,8 @@ static void emit_popup_configure(struct virt *popup)
         return;
     emitting = 1;
     for (i = 0; i < MAX_VIRT; i++) {
-        if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == popup->wl_surface) {
+        if (g.virts[i].proxy && g.virts[i].kind == V_SURFACE &&
+            g.virts[i].wl_surface == popup->wl_surface) {
             surface = &g.virts[i];
             break;
         }
@@ -765,7 +766,8 @@ static void emit_toplevel_configure(struct virt *toplevel)
         return;
     emitting = 1;
     for (i = 0; i < MAX_VIRT; i++) {
-        if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == toplevel->wl_surface) {
+        if (g.virts[i].proxy && g.virts[i].kind == V_SURFACE &&
+            g.virts[i].wl_surface == toplevel->wl_surface) {
             surface = &g.virts[i];
             break;
         }

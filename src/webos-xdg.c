@@ -249,7 +249,7 @@ static struct wl_display *wake_display;
 static int wake_pending_flag;
 
 static void show_keyboard(void);
-static void hide_keyboard(void);
+static int hide_keyboard(void);
 static void keyboard_closed(void);
 static void text_input_enter_main(void);
 static void ensure_text_model(void);
@@ -938,6 +938,26 @@ static int clicked_recently(void)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - last_click.tv_sec) * 1000 +
            (now.tv_nsec - last_click.tv_nsec) / 1000000 < 1500;
+}
+
+/* When the Back key read from evdev closed the webOS keyboard. The same
+ * press may also arrive through wl_keyboard and must do nothing more. */
+static struct timespec back_hid_keyboard;
+
+static void note_back_hid_keyboard(void)
+{
+    clock_gettime(CLOCK_MONOTONIC, &back_hid_keyboard);
+}
+
+static int back_hid_keyboard_recently(void)
+{
+    struct timespec now;
+
+    if (back_hid_keyboard.tv_sec == 0)
+        return 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - back_hid_keyboard.tv_sec) * 1000 +
+           (now.tv_nsec - back_hid_keyboard.tv_nsec) / 1000000 < 500;
 }
 
 /* GTK only enables text input on a surface it has been told it entered. */
@@ -3896,10 +3916,10 @@ static void show_keyboard(void)
  * asks, so Back, a click outside the address bar, and text_leave all land
  * here. Deactivating as well as hiding stops the IME reopening it on the
  * next focus event. */
-static void hide_keyboard(void)
+static int hide_keyboard(void)
 {
     if (!text_input || !keyboard_up)
-        return;
+        return 0;
     text_model_send(TM_HIDE_PANEL, 0);
     if (our_seat)
         text_model_deactivate(text_input, our_seat);
@@ -3913,6 +3933,7 @@ static void hide_keyboard(void)
     text_input = NULL;
     keyboard_closed();
     log_msg("keyboard hidden");
+    return 1;
 }
 
 static void text_commit_string(void *data, struct text_model *model, uint32_t serial,
@@ -4385,7 +4406,8 @@ static void apply_remote_event(struct ptr_ev ev)
     /* Back, read straight from evdev so it works even while the IME
      * panel holds Wayland focus. */
     if (ev.button == -3) {
-        hide_keyboard();
+        if (hide_keyboard())
+            note_back_hid_keyboard();
         return;
     }
     /* The compositor closes the window when it sees this notch.
@@ -4574,7 +4596,8 @@ static void *remote_thread(void *arg)
                     continue;
                 else if (ev.type == EV_REL && ev.code == REL_WHEEL && ev.value)
                     enqueue_remote(abs_x, abs_y, -2, ev.value);
-                else if (ev.type == EV_KEY && ev.code == KEY_BACK && ev.value == 1)
+                else if (ev.type == EV_KEY && (ev.code == KEY_BACK || ev.code == KEY_PREVIOUS) &&
+                         ev.value == 1)
                     enqueue_remote(abs_x, abs_y, -3, 1);
                 else if (ev.type == EV_KEY && center_button(ev.code))
                     enqueue_remote(abs_x, abs_y, BTN_LEFT, ev.value ? 1 : 0);
@@ -4686,6 +4709,18 @@ static int popup_is_open(void)
             (g.virts[i].subsurface || ov_enabled()))
             return 1;
     }
+    return 0;
+}
+
+/* True while Firefox has asked for a fullscreen window. It asks when a page
+ * uses the fullscreen API, as a video player does. */
+static int toplevel_fullscreen(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_VIRT; i++)
+        if (g.virts[i].proxy && g.virts[i].kind == V_TOPLEVEL && g.virts[i].fullscreen)
+            return 1;
     return 0;
 }
 
@@ -4909,6 +4944,29 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
         close(fd);
 }
 
+/* The key a press of the remote's Back key is passed on as, or 0 for none.
+ * The webOS keyboard closes first. Then Escape leaves a menu or a
+ * fullscreen video, as it does on a desktop. Otherwise KEY_BACK goes out.
+ * GTK's keymap turns it into XF86Back and Firefox into the Back command
+ * that opens the previous page. */
+static uint32_t back_key_code(void)
+{
+    if (keyboard_up || back_hid_keyboard_recently()) {
+        hide_keyboard();
+        log_trace("back: keyboard");
+        return 0;
+    }
+    if (popup_is_open() || toplevel_fullscreen()) {
+        log_trace("back: escape");
+        return KEY_ESC;
+    }
+    log_trace("back: previous page");
+    return KEY_BACK;
+}
+
+/* What the last Back press became, so its release matches. */
+static uint32_t back_as;
+
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state)
 {
@@ -4917,10 +4975,15 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
         log_trace("key %u", key);
-    /* 158 Back, 174 Exit. 1198/1199 are the wheel's cursor-show/hide keys. */
-    if (key == 158 || key == 174 || key == 1198 || key == 1199) {
-        if (key == 158 && state == WL_KEYBOARD_KEY_STATE_PRESSED)
-            hide_keyboard();
+    /* webOS 6.5 sends the remote's Back as KEY_PREVIOUS (412). */
+    if (key == KEY_BACK || key == KEY_PREVIOUS) {
+        if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+            back_as = back_key_code();
+        key = back_as;
+        if (!key)
+            return;
+    } else if (key == KEY_EXIT || key == 1198 || key == 1199) {
+        /* Exit, and the wheel's cursor-show/hide keys. */
         return;
     }
     if (orig && orig->key)

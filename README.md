@@ -67,6 +67,8 @@ touch /media/developer/apps/usr/palm/applications/com.github.gprot42.geckotv/way
 
 The launcher then sets `WAYLAND_DEBUG=1`, and libwayland logs every request and event into `geckotv.log`.
 
+How much the adapter and Firefox write to `geckotv.log` is fixed at build time. `make LOGLEVEL=1 app/geckotv` and `LOGLEVEL=1 build/build-adapter.sh` build a debugging pair. The adapter then logs every listener, key, pointer and focus event (several hundred lines per start) and the launcher writes `user.js` prefs that let Firefox dump chrome console messages and CSS errors to the log. The default `LOGLEVEL=0` is the release level. The adapter logs decisions, state changes and errors only, and the console prefs are written false. `MOZ_LOG` in the `env` file and the `wayland-debug` marker work at either level.
+
 ## Build requirements
 
 Building Firefox takes a lot of disk space, memory and time. Everything runs in a Linux container (`ffbuild`, podman), whose `/work` volume holds the source, toolchains and build output. Measured on an Apple Silicon Mac with a podman VM of 12 CPUs, 48 GB RAM and a 140 GB disk:

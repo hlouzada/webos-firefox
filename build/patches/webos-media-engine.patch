@@ -475,10 +475,10 @@ index 1bd4af56f2..20f90f83f7 100644
  if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
 new file mode 100644
-index 0000000000..1b8491ca4c
+index 0000000000..dc86594347
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,930 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1296,8 +1296,12 @@ index 0000000000..1b8491ca4c
 +        mVideo.mEnded = mAudio.mEnded = false;
 +        mVideo.mEosSent = mAudio.mEosSent = false;
 +        mVideo.mLastFedUs = mAudio.mLastFedUs = -1;
-+        RejectPending(mVideo);
-+        RejectPending(mAudio);
++        // The samples that wait here are from before the target, and their
++        // promises stay pending until the reader flushes the decoders. A
++        // rejection sent now can reach the reader before its flush, and it
++        // then keeps the cancel as a fatal error that silently stops the seek.
++        mVideo.mSample = nullptr;
++        mAudio.mSample = nullptr;
 +        Msg m{};
 +        m.type = GM_SEEK;
 +        m.time_us = target;

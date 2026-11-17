@@ -8,7 +8,11 @@ TC ?= /Users/aicoder/toolchains/arm-webos-linux-gnueabi_sdk-buildroot
 CC := $(TC)/bin/arm-webos-linux-gnueabi-gcc
 SYSROOT := $(TC)/arm-webos-linux-gnueabi/sysroot
 
-CFLAGS := --sysroot=$(SYSROOT) -O2 -Wall -Wextra -std=c11
+# Log level compiled into the launcher and the adapter. 0 is the release
+# level and 1 the debugging level described in the README. The adapter gets
+# it through build/build-adapter.sh.
+LOGLEVEL ?= 0
+CFLAGS := --sysroot=$(SYSROOT) -O2 -Wall -Wextra -std=c11 -DGECKOTV_LOGLEVEL=$(LOGLEVEL)
 LDFLAGS := --sysroot=$(SYSROOT) -lwayland-webos-client -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lm -ldl
 # The SDK's own wayland-scanner generates code that calls only functions the
 # TV's libwayland-client (1.11 on webOS 4) has. Newer scanners emit

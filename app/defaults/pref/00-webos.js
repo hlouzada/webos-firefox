@@ -74,6 +74,16 @@ pref("dom.audiochannel.audioCompeting", false);
 // either, so keep it off so sites never offer it.
 pref("media.av1.enabled", false);
 
+// Hardware video through LG's media pipeline. The engine is Firefox's webOS
+// media engine in build/patches/webos-media-engine.patch and takes H.264
+// or VP9 with AAC or no audio. It only acts when the launcher has set
+// GECKOTV_MEDIA_HELPER. The launcher sets it in GL window mode on a TV
+// with libplayerAPIs and elsewhere this pref changes nothing. While the
+// engine is available MediaSource.isTypeSupported refuses other codecs, so
+// YouTube negotiates VP9 or H.264 with AAC instead of Opus. Opus would
+// fall to software decoding.
+pref("media.webos.engine.enabled", true);
+
 // Graphics and video decoding are left at Firefox's own defaults on
 // purpose. The earlier file forced software WebRender and disabled
 // hardware video decoding, but since it was never read, every build so far

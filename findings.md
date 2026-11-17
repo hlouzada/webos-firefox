@@ -1744,3 +1744,39 @@ off by its own pref, so the line went. The remaining console errors
 `_searchProviderInfo is null`, `AboutHomeStartupCache`) appear with the old
 prefs and the old runtime too.
 
+**Betterfox.** `00-webos.js` ends with the Betterfox `user.js` (version
+154, 115 prefs) reduced to 70. 25 were already set above, and two of those
+keep the lower-memory value set here. Two have no pref in this ESR 153 tree
+and one is Windows-only. 17 would spend more RAM, flash or CPU than the
+current settings. Those are the font, canvas, media, network buffer and
+connection limits, the hour-long media read-ahead, downloads into the
+RAM-backed /tmp, the disk cache off, and a few more, and the file's comment
+lists them. With the block in place a headless run loaded the article with
+73 requests as before and no new console error, and a visible launch
+rendered it on the GPU path 9 s after the window appeared. Two of the kept
+prefs change behaviour rather than cost. One is HTTPS-only mode. The other
+is OCSP off, and together with CRLite off above that leaves no certificate
+revocation check.
+
+**What still recorded with uploads off.** These are now also disabled by
+prefs. They are the page-interaction rows in `places.sqlite`, the
+blocked-tracker database and its milestone prompt, search-page
+classification (the source of the `SearchSERPTelemetry` console error),
+the captcha-detection actor, the Reporting API and Glean's start at
+shutdown. Glean itself still initialises at start. With uploads off it
+records nothing and has no pref to skip it.
+
+**Logging is a build-time level.** One launch wrote 855 lines (48 KB) to
+`geckotv.log`, made of 478 adapter `listener wl_callback` lines, 255 other
+adapter lines, 61 graphics annotations, 33 keymap errors and 8 Firefox
+console lines. The console lines come from `browser.dom.window.dump.enabled`
+and `devtools.console.stdout.chrome`, and both default to true in an
+unofficial build. `LOGLEVEL` (Makefile and `build/build-adapter.sh`,
+default 0) now compiles the adapter's per-event lines out and makes the
+launcher write those two prefs and `layout.css.report_errors` false into
+`user.js` at each start through the same marked-block mechanism as the
+renderer pref. The same launch at level 0 wrote 243 lines (19 KB) with no
+console lines and no callback trace. What remains is the compositor
+inventory printed once per Firefox process (six or seven times), the
+graphics annotations that Firefox writes to stderr regardless of prefs, and
+xkbcommon's keymap errors. The log file itself still grows without bound.

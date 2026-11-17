@@ -475,10 +475,10 @@ index 1bd4af56f2..20f90f83f7 100644
  if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
 new file mode 100644
-index 0000000000..dc86594347
+index 0000000000..e15bef0075
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,930 @@
+@@ -0,0 +1,977 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -545,6 +545,7 @@ index 0000000000..dc86594347
 +  GM_EOS = 17,
 +  GM_STATUS = 19,
 +  GM_CLOSE = 20,
++  GM_UNLOAD = 21,
 +};
 +enum { GM_TRACK_VIDEO = 1, GM_TRACK_AUDIO = 2 };
 +enum { GM_VIDEO_H264 = 1, GM_VIDEO_VP9 = 2 };
@@ -1358,6 +1359,52 @@ index 0000000000..dc86594347
 +      }));
 +}
 +
++static bool SameBytes(const RefPtr<MediaByteBuffer>& aA,
++                      const RefPtr<MediaByteBuffer>& aB) {
++  size_t a = aA ? aA->Length() : 0;
++  size_t b = aB ? aB->Length() : 0;
++  return a == b && (a == 0 || memcmp(aA->Elements(), aB->Elements(), a) == 0);
++}
++
++// Firefox creates a new video decoder when the stream's parameter sets
++// change. An adaptive player does that when it switches level at a seek or
++// on a bandwidth change. The TV's decoder does not survive a new SPS
++// mid-stream, so the pipeline is dropped here and the next video sample
++// loads it again at the position.
++void WebOSEngineChannel::NotifyVideoConfig(const VideoInfo& aInfo) {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::NotifyVideoConfig",
++      [self = RefPtr{this}, this, info = aInfo] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        const VideoInfo& cur = mInfo.mVideo;
++        if (cur.mImage == info.mImage && cur.mDisplay == info.mDisplay &&
++            SameBytes(cur.mExtraData, info.mExtraData)) {
++          return;
++        }
++        LOG("video config %dx%d (%u bytes) -> %dx%d (%u bytes)%s",
++            cur.mImage.width, cur.mImage.height,
++            unsigned(cur.mExtraData ? cur.mExtraData->Length() : 0),
++            info.mImage.width, info.mImage.height,
++            unsigned(info.mExtraData ? info.mExtraData->Length() : 0),
++            mPipelineRequested ? ", reloading the pipeline" : "");
++        mInfo.mVideo = info;
++        if (!mPipelineRequested) {
++          return;
++        }
++        Msg m{};
++        m.type = GM_UNLOAD;
++        if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                           RESULT_DETAIL("webOS helper stopped answering UNLOAD")));
++          return;
++        }
++        mVideo.mLastFedUs = mAudio.mLastFedUs = -1;
++        HandleReply(m);
++      }));
++}
++
 +void WebOSEngineChannel::SetVideoRect(const gfx::IntRect& aRect) {
 +  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
 +      "WebOSEngineChannel::SetVideoRect", [self = RefPtr{this}, this, aRect] {
@@ -1411,10 +1458,10 @@ index 0000000000..dc86594347
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngine.h b/dom/media/platforms/webos/WebOSEngine.h
 new file mode 100644
-index 0000000000..2211492258
+index 0000000000..dbbd1541dc
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,185 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1468,6 +1515,7 @@ index 0000000000..2211492258
 +  void SetVolume(double aVolume);
 +  void NotifyEndOfStream(TrackInfo::TrackType aType);
 +  void SetVideoRect(const gfx::IntRect& aRect);
++  void NotifyVideoConfig(const VideoInfo& aInfo);
 +  media::TimeUnit GetCurrentPosition() const {
 +    return media::TimeUnit::FromMicroseconds(mPositionUs);
 +  }
@@ -1601,10 +1649,10 @@ index 0000000000..2211492258
 +#endif  // DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
 diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
 new file mode 100644
-index 0000000000..9fc18a1918
+index 0000000000..44fba424a2
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,167 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1728,6 +1776,9 @@ index 0000000000..9fc18a1918
 +            ("WebOSEngineDecoderModule: no engine %" PRIu64,
 +             *aParams.mMediaEngineId));
 +    return nullptr;
++  }
++  if (aParams.mConfig.IsVideo()) {
++    channel->NotifyVideoConfig(*aParams.mConfig.GetAsVideoInfo());
 +  }
 +  RefPtr<MediaDataDecoder> decoder =
 +      new WebOSEngineStream(channel, aParams.mConfig);

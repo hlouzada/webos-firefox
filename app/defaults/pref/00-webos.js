@@ -172,6 +172,87 @@ pref("toolkit.startup.max_resumed_crashes", -1);
 // flash storage does not need that.
 pref("browser.sessionstore.interval", 120000);
 
+// Betterfox (github.com/yokoffing/Betterfox, user.js for 154) without the
+// prefs already set above, the ones this ESR 153 tree has no pref for
+// (toolkit.telemetry.coverage.opt-out, activity-stream.feeds.telemetry),
+// the Windows-only ones, and every line that would spend more RAM, flash
+// or CPU than the current settings. Those are the larger font, canvas,
+// media, network buffer and connection limits, the hour-long media
+// read-ahead, the shorter reflow interval, the 64 MB in-memory media
+// cache, downloads into /tmp (RAM on this TV), the disk cache switched
+// off, userChrome.css lookups, find-bar highlight-all and untruncated
+// pastes. Without the disk cache repeat visits would refetch and
+// re-decompress every script. OCSP off and CRLite off above together
+// leave no certificate revocation check at all.
+pref("network.dnsCacheExpiration", 3600);
+pref("browser.contentblocking.category", "strict");
+pref("browser.uitour.enabled", false);
+pref("privacy.globalprivacycontrol.enabled", true);
+pref("security.OCSP.enabled", 0);
+pref("privacy.antitracking.isolateContentScriptResources", true);
+pref("security.csp.reporting.enabled", false);
+pref("security.ssl.treat_unsafe_negotiation_as_broken", true);
+pref("browser.xul.error_pages.expert_bad_cert", true);
+pref("security.tls.enable_0rtt_data", false);
+pref("privacy.history.custom", true);
+pref("network.http.speculative-parallel-limit", 0);
+pref("network.dns.disablePrefetchFromHTTPS", true);
+pref("browser.urlbar.trimHttps", true);
+pref("browser.urlbar.untrimOnUserInteraction.featureGate", true);
+pref("browser.search.separatePrivateDefault.ui.enabled", true);
+pref("browser.urlbar.groupLabels.enabled", false);
+pref("browser.formfill.enable", false);
+pref("network.IDN_show_punycode", true);
+pref("dom.security.https_only_mode", true);
+pref("dom.security.https_only_mode_error_page_user_suggestions", true);
+pref("signon.formlessCapture.enabled", false);
+pref("signon.privateBrowsingCapture.enabled", false);
+pref("network.auth.subresource-http-auth-allow", 1);
+pref("extensions.enabledScopes", 5);
+pref("network.http.referer.XOriginTrimmingPolicy", 2);
+pref("pdfjs.enableScripting", false);
+pref("permissions.default.desktop-notification", 2);
+pref("permissions.default.geo", 2);
+pref("geo.provider.network.url", "https://beacondb.net/v1/geolocate");
+pref("permissions.manager.defaultsUrl", "");
+pref("toolkit.telemetry.server", "data:,");
+pref("toolkit.telemetry.archive.enabled", false);
+pref("toolkit.telemetry.newProfilePing.enabled", false);
+pref("toolkit.telemetry.shutdownPingSender.enabled", false);
+pref("toolkit.telemetry.updatePing.enabled", false);
+pref("toolkit.telemetry.bhrPing.enabled", false);
+pref("toolkit.telemetry.firstShutdownPing.enabled", false);
+pref("toolkit.coverage.opt-out", true);
+pref("toolkit.coverage.endpoint.base", "");
+pref("datareporting.usage.uploadEnabled", false);
+pref("app.normandy.api_url", "");
+pref("nimbus.rollouts.enabled", false);
+pref("breakpad.reportURL", "");
+pref("browser.tabs.crashReporting.sendReport", false);
+pref("extensions.getAddons.showPane", false);
+pref("extensions.htmlaboutaddons.recommendations.enabled", false);
+pref("browser.discovery.enabled", false);
+pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.addons", false);
+pref("browser.newtabpage.activity-stream.asrouter.userprefs.cfr.features", false);
+pref("browser.preferences.moreFromMozilla", false);
+pref("browser.aboutConfig.showWarning", false);
+pref("browser.startup.homepage_override.mstone", "ignore");
+pref("browser.aboutwelcome.enabled", false);
+pref("browser.compactmode.show", true);
+pref("browser.ai.control.default", "blocked");
+pref("browser.ml.chat.menu", false);
+pref("browser.tabs.groups.smart.enabled", false);
+pref("full-screen-api.transition-duration.enter", "0 0");
+pref("full-screen-api.transition-duration.leave", "0 0");
+pref("full-screen-api.warning.timeout", 0);
+pref("browser.newtabpage.activity-stream.default.sites", "");
+pref("browser.newtabpage.activity-stream.showSponsoredTopSites", false);
+pref("browser.newtabpage.activity-stream.showSponsored", false);
+pref("browser.newtabpage.activity-stream.showSponsoredCheckboxes", false);
+pref("browser.download.manager.addToRecentDocs", false);
+pref("browser.download.open_pdf_attachments_inline", true);
+pref("browser.bookmarks.openInTabClosesMenu", false);
+
 // Housekeeping.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);

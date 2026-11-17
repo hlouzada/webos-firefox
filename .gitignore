@@ -43,3 +43,6 @@ app/marionette
 # Rust build output
 target/
 experiments/*/out/
+
+# Local env vars
+.env

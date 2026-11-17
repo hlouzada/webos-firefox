@@ -475,10 +475,10 @@ index 1bd4af56f2..20f90f83f7 100644
  if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
 new file mode 100644
-index 0000000000..e15bef0075
+index 0000000000..dfca0305af
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,986 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -523,6 +523,9 @@ index 0000000000..e15bef0075
 +          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
 +#define LOGW(fmt, ...)                                           \
 +  MOZ_LOG(sWebOSEngineLog, LogLevel::Warning,                    \
++          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
++#define LOGV(fmt, ...)                                           \
++  MOZ_LOG(sWebOSEngineLog, LogLevel::Verbose,                    \
 +          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
 +
 +// Wire format shared with the helper, src/media-protocol.h in the app
@@ -1072,6 +1075,8 @@ index 0000000000..e15bef0075
 +    return false;
 +  }
 +  int result = m.arg[0];
++  LOGV("fed %s pts=%" PRId64 " result=%d",
++       aType == TrackInfo::kVideoTrack ? "video" : "audio", pts, result);
 +  HandleReply(m);
 +  if (mFatal) {
 +    return false;
@@ -1438,6 +1443,9 @@ index 0000000000..e15bef0075
 +                          RESULT_DETAIL("sample submitted while one waits")),
 +              __func__);
 +        }
++        LOGV("submit %s pts=%" PRId64 " key=%d",
++             aType == TrackInfo::kVideoTrack ? "video" : "audio",
++             sample->mTime.ToMicroseconds(), int(sample->mKeyframe));
 +        track.mSample = std::move(sample);
 +        RefPtr<DecodePromise> p = track.mPromise.Ensure(__func__);
 +        Pump();
@@ -1454,6 +1462,7 @@ index 0000000000..e15bef0075
 +
 +#undef LOG
 +#undef LOGW
++#undef LOGV
 +
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngine.h b/dom/media/platforms/webos/WebOSEngine.h

@@ -1,7 +1,8 @@
 #!/bin/bash
-# Host test of src/webos-xdg.c's video plane placement. Needs wayland-scanner, the
-# wayland-client headers and library on the host (conda's work:
-# WAYLAND_PREFIX=$HOME/miniconda3) and xdg-shell.xml plus
+# Host tests of src/webos-xdg.c covering video plane placement and toplevel
+# states. Needs wayland-scanner and the wayland-client headers and library on
+# the host (conda's work with WAYLAND_PREFIX=$HOME/miniconda3), and
+# xdg-shell.xml plus
 # text-input-unstable-v3.xml from wayland-protocols, fetched if missing.
 #   bash tests/adapter/run.sh
 set -euo pipefail
@@ -36,7 +37,11 @@ void *webos_xdg_last_caller(void) { return 0; }
 struct wl_display *webos_xdg_proxy_display(struct wl_proxy *p) { (void)p; return 0; }
 int webos_xdg_on_default_queue(struct wl_proxy *p) { (void)p; return 1; }
 STUBS
-gcc -std=gnu11 -w -I"$GEN" -I"$PREFIX/include" -o "$BUILD/video-clip" "$HERE/video-clip.c" \
-    "$GEN"/*-protocol.c "$GEN/stubs.c" -L"$PREFIX/lib" -Wl,-rpath,"$PREFIX/lib" \
-    -lwayland-client -lxkbcommon -lpthread -ldl -lm
-"$BUILD/video-clip"
+status=0
+for t in video-clip toplevel-state; do
+    gcc -std=gnu11 -w -I"$GEN" -I"$PREFIX/include" -o "$BUILD/$t" "$HERE/$t.c" \
+        "$GEN"/*-protocol.c "$GEN/stubs.c" -L"$PREFIX/lib" -Wl,-rpath,"$PREFIX/lib" \
+        -lwayland-client -lxkbcommon -lpthread -ldl -lm
+    "$BUILD/$t" || status=1
+done
+exit $status

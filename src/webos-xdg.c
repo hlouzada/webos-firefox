@@ -2993,6 +2993,19 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
         pthread_mutex_unlock(&ov_mu);
         return 0;
     }
+    /* Firefox marks the chrome's opaque parts as the window's opaque
+     * region. The compositor would then skip blending there and the video
+     * hole (alpha 0 pixels over the hardware plane) would come out black,
+     * so the GL window declares no opaque region at all. */
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_SET_OPAQUE_REGION && args[0].o &&
+        gl_mode() && proxy == gl_window) {
+        static int told;
+
+        if (!told++)
+            log_msg("GL window: opaque region dropped, the window stays blendable");
+        args[0].o = NULL;
+        return 0;
+    }
     /* Flat mode: the adapter answers frame callbacks itself (flat_sync_done);
      * the copied surfaces are never shown, and a webOS 6.5 TV answers not even
      * the window's. The window is made now if need be and a frame of it

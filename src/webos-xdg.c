@@ -4689,6 +4689,18 @@ static int popup_is_open(void)
     return 0;
 }
 
+/* True while Firefox has asked for a fullscreen window. It asks when a page
+ * uses the fullscreen API, as a video player does. */
+static int toplevel_fullscreen(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_VIRT; i++)
+        if (g.virts[i].proxy && g.virts[i].kind == V_TOPLEVEL && g.virts[i].fullscreen)
+            return 1;
+    return 0;
+}
+
 static int is_popup_surface(struct wl_surface *surface)
 {
     int i;
@@ -4909,6 +4921,29 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
         close(fd);
 }
 
+/* The key a press of the remote's Back key is passed on as, or 0 for none.
+ * The webOS keyboard closes first. Then Escape leaves a menu or a
+ * fullscreen video, as it does on a desktop. Otherwise KEY_BACK goes out.
+ * GTK's keymap turns it into XF86Back and Firefox into the Back command
+ * that opens the previous page. */
+static uint32_t back_key_code(void)
+{
+    if (keyboard_up) {
+        hide_keyboard();
+        log_trace("back: keyboard");
+        return 0;
+    }
+    if (popup_is_open() || toplevel_fullscreen()) {
+        log_trace("back: escape");
+        return KEY_ESC;
+    }
+    log_trace("back: previous page");
+    return KEY_BACK;
+}
+
+/* What the last Back press became, so its release matches. */
+static uint32_t back_as;
+
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                          uint32_t time, uint32_t key, uint32_t state)
 {
@@ -4917,10 +4952,14 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
         log_trace("key %u", key);
-    /* 158 Back, 174 Exit. 1198/1199 are the wheel's cursor-show/hide keys. */
-    if (key == 158 || key == 174 || key == 1198 || key == 1199) {
-        if (key == 158 && state == WL_KEYBOARD_KEY_STATE_PRESSED)
-            hide_keyboard();
+    if (key == KEY_BACK) {
+        if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+            back_as = back_key_code();
+        key = back_as;
+        if (!key)
+            return;
+    } else if (key == KEY_EXIT || key == 1198 || key == 1199) {
+        /* Exit, and the wheel's cursor-show/hide keys. */
         return;
     }
     if (orig && orig->key)

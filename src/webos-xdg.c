@@ -26,6 +26,7 @@
 #include "text-model-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "webos-surface-group-client-protocol.h"
+#include "webos-foreign-client-protocol.h"
 
 /* Compiled into libwayland-client. Requests are intercepted after
  * libwayland has parsed the argument list, then translated onto the
@@ -796,6 +797,21 @@ static int flat_mode(void);
 static void flat_pump_start(void);
 static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface);
 static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws);
+static int gl_mode(void);
+static void gl_main_mapped(struct virt *xdg_surface, struct wl_proxy *gtk_surface);
+static void gl_window_set(struct wl_proxy *child);
+static void gl_popup_place(struct wl_proxy *popup, int32_t x, int32_t y, int32_t w, int32_t h);
+static void gl_popup_child(struct wl_proxy *child, struct wl_proxy *popup);
+static void gl_popup_offset(struct wl_proxy *child, int32_t x, int32_t y);
+static void gl_popup_remove(struct wl_proxy *popup);
+static void gl_surface_destroyed(struct wl_proxy *surface);
+static struct wl_proxy *gl_popup_of_child(struct wl_proxy *child);
+static int gl_passthrough(struct wl_proxy *surface);
+static struct wl_surface *gl_hit(int32_t x, int32_t y, int32_t *ox, int32_t *oy);
+static int gl_window_commit(struct wl_proxy *surface, int attached);
+static struct wl_proxy *gl_main_surface(void);
+static void gl_pending_add(struct wl_proxy *child, struct wl_proxy *parent);
+static int gl_held(struct wl_proxy *surface, uint32_t opcode, union wl_argument *args);
 
 static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surface)
 {
@@ -809,6 +825,10 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
     xdg_surface->wl_surface = wl_surface;
     if (!g.shell || !wl_surface) {
         log_msg("cannot map shell=%p surface=%p", (void *)g.shell, (void *)wl_surface);
+        return;
+    }
+    if (gl_mode() && !mapped_one) {
+        gl_main_mapped(xdg_surface, wl_surface);
         return;
     }
     /* In flat mode the window the compositor sees is the overlay surface. */
@@ -1001,6 +1021,14 @@ static struct wl_surface *input_surface(struct wl_surface *surface)
 {
     if (ov_surface && surface == ov_surface && main_surface)
         return main_surface;
+    if (gl_mode()) {
+        struct wl_proxy *popup = gl_popup_of_child((struct wl_proxy *)surface);
+
+        if (popup)
+            return (struct wl_surface *)popup;
+        if (surface && surface == (struct wl_surface *)gl_popup_of_child(NULL) && main_surface)
+            return main_surface;
+    }
     return is_layered(surface) && main_surface ? main_surface : surface;
 }
 
@@ -1069,6 +1097,18 @@ static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
 {
     int i;
 
+    if (gl_mode() && child && parent) {
+        /* Untagged: the first window's content surface becomes the card, a
+         * pop-up's content is attached into it (gl_popup_child keeps a
+         * child whose parent has no role yet). */
+        if (parent == gl_main_surface())
+            gl_window_set(child);
+        else if (gl_main_surface() || ov_is_popup(parent))
+            gl_popup_child(child, parent);
+        else
+            gl_pending_add(child, parent);
+        return;
+    }
     tag_child_surface(child);
     if (child && parent && flat_mode()) {   /* copied into the flat window */
         ov_child(child, parent);
@@ -1501,6 +1541,8 @@ static int ov_ensure(void)
 
     if (ov_surface)
         return 1;
+    if (gl_mode())
+        return 0;
     if (ov_failed || !g.registry || (!main_group && !flat_mode()) || !host_compositor_name ||
         !host_shm_name)
         return 0;
@@ -1751,6 +1793,8 @@ static void ov_popup_gone(struct wl_proxy *surface)
 {
     int i, p;
 
+    if (gl_mode())
+        gl_popup_remove(surface);
     pthread_mutex_lock(&ov_mu);
     p = ov_popup_slot(surface);
     if (p >= 0) {
@@ -1795,6 +1839,8 @@ static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y)
 {
     struct ov_item *it;
 
+    if (gl_mode())
+        gl_popup_offset(child, x, y);
     pthread_mutex_lock(&ov_mu);
     it = ov_item_find(child);
     if (it && it->popup != child) {
@@ -1990,7 +2036,7 @@ static void *flat_pump(void *unused)
     for (;;) {
         usleep(20 * 1000);
         pthread_mutex_lock(&ov_mu);
-        if ((ov_dirty || ov_flat_test()) && ov_surface)
+            if ((ov_dirty || ov_flat_test()) && ov_surface)
             ov_update();
         flat_answer_maybe();
         if (getenv("WEBOS_XDG_OV_DEBUG") && now_ms() - reported >= 5000) {
@@ -2026,6 +2072,520 @@ static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shel
     if (ws)
         wl_webos_shell_surface_set_state(ws, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
     log_msg("flat window shown for %p", (void *)gtk_surface);
+}
+
+/* GL window mode (WEBOS_XDG_GL=1 on a flat-mode compositor). Firefox draws
+ * with the GPU, and the Mali driver's buffers cannot be copied the way the
+ * flat window copies shared memory, so Firefox's content surface (the
+ * subsurface it makes under GTK's first window) is the window the
+ * compositor sees: it gets the wl_shell toplevel and the app's
+ * wl_webos_shell properties, and its requests pass through. GTK's own
+ * window surface is never shown; as in flat mode its frame callbacks are
+ * answered here and its buffers released, without copying. Each pop-up's
+ * content surface is attached into a region of the window exported through
+ * wl_webos_foreign at the pop-up's place, which the compositor composes
+ * above the window (measured on a webOS 6.5 TV, findings.md section 19);
+ * until it is attached, its content is held back, since an untagged
+ * surface with content becomes a card. Pointer and keyboard events come on
+ * the window and go to GTK's window, or to the pop-up whose region is
+ * under the pointer. The GL state is read and written under ov_mu. */
+#define GL_POPUPS 16
+#define GL_PENDING 8
+static struct gl_popup {
+    struct wl_proxy *popup;         /* GTK's pop-up surface */
+    struct wl_proxy *child;         /* Firefox's content surface inside it */
+    struct wl_webos_exported *exported;
+    struct wl_webos_imported *imported;
+    char window_id[128];
+    int32_t x, y, w, h;             /* the region in the window */
+    int32_t off_x, off_y;           /* the child's offset in the pop-up */
+    int attached;
+    struct wl_proxy *held_buffer;   /* the child's last attach while held back */
+    int held_commit;
+    unsigned seq;
+} gl_popups[GL_POPUPS];
+static unsigned gl_seq;
+static struct wl_proxy *gl_main;    /* GTK's first window surface */
+static struct wl_proxy *gl_window;
+static struct wl_shell_surface *gl_shell;
+static struct wl_webos_shell_surface *gl_webos;
+static struct wl_webos_foreign *gl_foreign;
+static struct wl_compositor *gl_compositor;
+static int gl_window_buffer;       /* a buffer was attached since the last commit */
+static int gl_window_shown;
+/* Content surfaces seen before their parent had a role. */
+static struct { struct wl_proxy *child, *parent; } gl_pending[GL_PENDING];
+
+static int gl_mode(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_GL");
+        int want = e && *e == '1';
+
+        /* flat_mode is only known once the registry has been read. */
+        if (!want)
+            on = 0;
+        else if (host_foreign_name || host_subcompositor_name)
+            on = flat_mode();
+        else
+            return 0;
+        if (on)
+            log_msg("GL window mode: Firefox's content surface is the window");
+    }
+    return on;
+}
+
+static struct wl_proxy *gl_main_surface(void)
+{
+    return gl_main;
+}
+
+static struct gl_popup *gl_popup_find(struct wl_proxy *popup)
+{
+    int i;
+
+    for (i = 0; popup && i < GL_POPUPS; i++)
+        if (gl_popups[i].popup == popup)
+            return &gl_popups[i];
+    return NULL;
+}
+
+/* The pop-up whose content surface this is; NULL asks for the GL window. */
+static struct wl_proxy *gl_popup_of_child(struct wl_proxy *child)
+{
+    int i;
+
+    if (!child)
+        return gl_window;
+    for (i = 0; i < GL_POPUPS; i++)
+        if (gl_popups[i].popup && gl_popups[i].child == child)
+            return gl_popups[i].popup;
+    return NULL;
+}
+
+static int gl_passthrough(struct wl_proxy *surface)
+{
+    return gl_mode() && surface &&
+           (surface == gl_window || gl_popup_of_child(surface) != NULL);
+}
+
+static void gl_pending_add(struct wl_proxy *child, struct wl_proxy *parent)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING && gl_pending[i].child; i++)
+        ;
+    if (i == GL_PENDING) {
+        log_msg("GL mode: too many content surfaces waiting for a parent, %p dropped",
+                (void *)child);
+        return;
+    }
+    gl_pending[i].child = child;
+    gl_pending[i].parent = parent;
+    log_msg("GL mode: content surface %p of %p kept until its parent has a role", (void *)child,
+            (void *)parent);
+}
+
+static struct wl_proxy *gl_pending_take(struct wl_proxy *parent)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING; i++)
+        if (gl_pending[i].child && gl_pending[i].parent == parent) {
+            struct wl_proxy *child = gl_pending[i].child;
+
+            gl_pending[i].child = gl_pending[i].parent = NULL;
+            return child;
+        }
+    return NULL;
+}
+
+static void gl_pending_drop(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING; i++)
+        if (gl_pending[i].child == surface || gl_pending[i].parent == surface)
+            gl_pending[i].child = gl_pending[i].parent = NULL;
+}
+
+static void gl_main_mapped(struct virt *xdg_surface, struct wl_proxy *gtk_surface)
+{
+    struct wl_proxy *child;
+
+    (void)xdg_surface;
+    pthread_mutex_lock(&ov_mu);
+    gl_main = gtk_surface;
+    main_surface = (struct wl_surface *)gtk_surface;
+    mapped_one = 1;
+    pthread_mutex_unlock(&ov_mu);
+    text_input_enter_main();
+    flat_pump_start();
+    /* Never shown. No card, frames answered and buffers released here. */
+    tag_surface_as(gtk_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+    ov_popup_at(gtk_surface, 0, 0);
+    log_msg("GL mode: GTK's window %p mapped, waiting for Firefox's content surface",
+            (void *)gtk_surface);
+    pthread_mutex_lock(&ov_mu);
+    child = gl_pending_take(gtk_surface);
+    pthread_mutex_unlock(&ov_mu);
+    if (child)
+        gl_window_set(child);
+}
+
+static void gl_popup_detach(struct gl_popup *gp)
+{
+    if (gp->imported) {
+        if (gp->attached && gp->child)
+            wl_webos_imported_detach_surface(gp->imported, (struct wl_surface *)gp->child);
+        wl_webos_imported_destroy(gp->imported);
+        gp->imported = NULL;
+    }
+    if (gp->exported) {
+        wl_webos_exported_destroy(gp->exported);
+        gp->exported = NULL;
+    }
+    gp->window_id[0] = '\0';
+    gp->attached = 0;
+}
+
+/* Firefox's content surface, the card. The first content committed to it
+ * maps it. Full screen is asked for again right after that commit because
+ * webOS 6 ignores it on an empty surface. */
+static void gl_window_set(struct wl_proxy *child)
+{
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    if (gl_window == child) {
+        pthread_mutex_unlock(&ov_mu);
+        return;
+    }
+    if (gl_window) {
+        log_msg("GL window %p replaced by %p", (void *)gl_window, (void *)child);
+        for (i = 0; i < GL_POPUPS; i++)
+            if (gl_popups[i].popup)
+                gl_popup_detach(&gl_popups[i]);
+        if (gl_webos) {
+            wl_webos_shell_surface_destroy(gl_webos);
+            gl_webos = NULL;
+        }
+        forget_shell_role(gl_window);
+        gl_shell = NULL;
+    }
+    gl_window = child;
+    gl_window_buffer = gl_window_shown = 0;
+    bind_named();
+    gl_shell = shell_role(child);
+    if (gl_shell)
+        wl_shell_surface_set_toplevel(gl_shell);
+    if (g.webos) {
+        gl_webos = wl_webos_shell_get_shell_surface(g.webos, (struct wl_surface *)child);
+        if (gl_webos) {
+            wl_webos_shell_surface_set_property(gl_webos, "appId", our_app_id());
+            wl_webos_shell_surface_set_property(gl_webos, "title", "Firefox");
+            wl_webos_shell_surface_set_property(gl_webos, "displayAffinity", "0");
+            wl_webos_shell_surface_set_property(gl_webos, "_WEBOS_ACCESS_POLICY_KEYS_BACK",
+                                                "true");
+            wl_webos_shell_surface_set_key_mask(gl_webos, 0xFFFFFFFAu);
+            wl_webos_shell_surface_set_property(gl_webos, "_WEBOS_CURSOR_SLEEP_TIME", "-1");
+            wl_webos_shell_surface_set_state(gl_webos, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+        }
+    }
+    log_msg("GL window %p: shell=%p webos=%p", (void *)child, (void *)gl_shell, (void *)gl_webos);
+    for (i = 0; i < GL_POPUPS; i++)
+        if (gl_popups[i].popup && !gl_popups[i].exported)
+            gl_popup_place(gl_popups[i].popup, gl_popups[i].x, gl_popups[i].y, gl_popups[i].w,
+                           gl_popups[i].h);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* attached is 1 for an attach request with a buffer, 0 for one without and
+ * -1 for a commit. Returns 1 when the request was sent here. That happens
+ * for the first content commit, followed by the fullscreen request. */
+static int gl_window_commit(struct wl_proxy *surface, int attached)
+{
+    int sent = 0;
+
+    pthread_mutex_lock(&ov_mu);
+    if (gl_window && surface == gl_window) {
+        if (attached >= 0) {
+            gl_window_buffer = attached;
+        } else if (gl_window_buffer && !gl_window_shown) {
+            gl_window_shown = 1;
+            ov_inside = 1;
+            wl_surface_commit((struct wl_surface *)surface);
+            if (gl_webos)
+                wl_webos_shell_surface_set_state(gl_webos,
+                                                 WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+            ov_inside = 0;
+            log_msg("GL window %p shown", (void *)surface);
+            sent = 1;
+        } else {
+            gl_window_buffer = 0;
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return sent;
+}
+
+static struct wl_webos_foreign *gl_foreign_get(void)
+{
+    if (!gl_foreign && host_foreign_name && g.registry)
+        gl_foreign = wl_registry_bind(g.registry, host_foreign_name, &wl_webos_foreign_interface,
+                                      1);
+    return gl_foreign;
+}
+
+static struct wl_compositor *gl_compositor_get(void)
+{
+    if (!gl_compositor && g.registry && host_compositor_name)
+        gl_compositor = wl_registry_bind(g.registry, host_compositor_name,
+                                         &wl_compositor_interface,
+                                         server_compositor_version &&
+                                                 server_compositor_version < 3
+                                             ? server_compositor_version : 3);
+    return gl_compositor;
+}
+
+static void gl_region_apply(struct gl_popup *gp)
+{
+    struct wl_region *region;
+
+    if (!gp->exported || !gl_compositor_get())
+        return;
+    region = wl_compositor_create_region(gl_compositor_get());
+    wl_region_add(region, gp->x + gp->off_x, gp->y + gp->off_y, gp->w, gp->h);
+    wl_webos_exported_set_exported_window(gp->exported, region, region);
+    wl_region_destroy(region);
+}
+
+/* With ov_mu held. Once attached, the content held back goes out. */
+static void gl_attach_maybe(struct gl_popup *gp)
+{
+    if (gp->attached || !gp->child || !gp->window_id[0] || !gl_foreign)
+        return;
+    gp->imported = wl_webos_foreign_import_element(
+        gl_foreign, gp->window_id, WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT);
+    wl_webos_imported_attach_surface(gp->imported, (struct wl_surface *)gp->child);
+    gp->attached = 1;
+    ov_inside = 1;
+    if (gp->held_buffer) {
+        wl_surface_attach((struct wl_surface *)gp->child, (struct wl_buffer *)gp->held_buffer, 0,
+                          0);
+        wl_surface_damage((struct wl_surface *)gp->child, 0, 0, gp->w, gp->h);
+    }
+    if (gp->held_buffer || gp->held_commit)
+        wl_surface_commit((struct wl_surface *)gp->child);
+    ov_inside = 0;
+    log_msg("GL pop-up %p: content %p attached into %s at %d,%d %dx%d%s", (void *)gp->popup,
+            (void *)gp->child, gp->window_id, gp->x + gp->off_x, gp->y + gp->off_y, gp->w, gp->h,
+            gp->held_buffer ? " (held content sent)" : "");
+    gp->held_buffer = NULL;
+    gp->held_commit = 0;
+}
+
+/* A request on a pop-up's content surface that is not attached yet is held
+ * back: its last buffer is remembered and sent on attachment. Returns 1
+ * when the request must not reach the compositor. */
+static int gl_held(struct wl_proxy *surface, uint32_t opcode, union wl_argument *args)
+{
+    struct wl_proxy *popup;
+    struct gl_popup *gp;
+    int held = 0;
+
+    pthread_mutex_lock(&ov_mu);
+    popup = gl_popup_of_child(surface);
+    gp = popup ? gl_popup_find(popup) : NULL;
+    if (gp && !gp->attached) {
+        if (opcode == WL_SURFACE_ATTACH && args)
+            gp->held_buffer = (struct wl_proxy *)args[0].o;
+        else if (opcode == WL_SURFACE_COMMIT)
+            gp->held_commit = 1;
+        held = 1;
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return held;
+}
+
+static void gl_exported_id(void *data, struct wl_webos_exported *e, const char *id, uint32_t type)
+{
+    struct gl_popup *gp = data;
+
+    (void)type;
+    pthread_mutex_lock(&ov_mu);
+    if (gp->popup && gp->exported == e) {
+        snprintf(gp->window_id, sizeof gp->window_id, "%s", id ? id : "");
+        gl_attach_maybe(gp);
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static const struct wl_webos_exported_listener gl_exported_listener = { gl_exported_id };
+
+static void gl_popup_place(struct wl_proxy *popup, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+    struct gl_popup *gp;
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    gp = gl_popup_find(popup);
+    if (!gp) {
+        for (i = 0; i < GL_POPUPS && gl_popups[i].popup; i++)
+            ;
+        if (i == GL_POPUPS) {
+            log_msg("GL pop-up table full");
+            pthread_mutex_unlock(&ov_mu);
+            return;
+        }
+        gp = &gl_popups[i];
+        memset(gp, 0, sizeof *gp);
+        gp->popup = popup;
+        gp->seq = ++gl_seq;
+        gp->child = gl_pending_take(popup);
+    }
+    gp->x = x;
+    gp->y = y;
+    if (w > 0 && h > 0) {
+        gp->w = w;
+        gp->h = h;
+    }
+    if (gl_window && gp->w > 0 && gp->h > 0) {
+        if (!gl_foreign_get()) {
+            log_msg("GL pop-up %p: no wl_webos_foreign, not shown", (void *)popup);
+        } else {
+            if (!gp->exported) {
+                gp->exported = wl_webos_foreign_export_element(
+                    gl_foreign, (struct wl_surface *)gl_window,
+                    WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT);
+                wl_webos_exported_add_listener(gp->exported, &gl_exported_listener, gp);
+            }
+            gl_region_apply(gp);
+            gl_attach_maybe(gp);
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void gl_popup_child(struct wl_proxy *child, struct wl_proxy *popup)
+{
+    struct gl_popup *gp;
+
+    pthread_mutex_lock(&ov_mu);
+    gp = gl_popup_find(popup);
+    if (!gp) {
+        gl_pending_add(child, popup);
+        pthread_mutex_unlock(&ov_mu);
+        return;
+    }
+    if (gp->child && gp->child != child && gp->attached && gp->imported) {
+        wl_webos_imported_detach_surface(gp->imported, (struct wl_surface *)gp->child);
+        wl_webos_imported_destroy(gp->imported);
+        gp->imported = NULL;
+        gp->attached = 0;
+    }
+    gp->child = child;
+    gp->held_buffer = NULL;
+    gp->held_commit = 0;
+    gl_attach_maybe(gp);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void gl_popup_offset(struct wl_proxy *child, int32_t x, int32_t y)
+{
+    struct wl_proxy *popup;
+    struct gl_popup *gp;
+
+    pthread_mutex_lock(&ov_mu);
+    popup = gl_popup_of_child(child);
+    gp = popup ? gl_popup_find(popup) : NULL;
+    if (gp && (gp->off_x != x || gp->off_y != y)) {
+        gp->off_x = x;
+        gp->off_y = y;
+        gl_region_apply(gp);
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void gl_popup_remove(struct wl_proxy *popup)
+{
+    struct gl_popup *gp;
+
+    pthread_mutex_lock(&ov_mu);
+    gp = gl_popup_find(popup);
+    if (gp) {
+        gl_popup_detach(gp);
+        log_msg("GL pop-up %p gone", (void *)popup);
+        memset(gp, 0, sizeof *gp);
+    }
+    gl_pending_drop(popup);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+static void gl_surface_destroyed(struct wl_proxy *surface)
+{
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    if (surface == gl_window) {
+        if (gl_webos) {
+            wl_webos_shell_surface_destroy(gl_webos);
+            gl_webos = NULL;
+        }
+        gl_shell = NULL;
+        gl_window = NULL;
+        for (i = 0; i < GL_POPUPS; i++)
+            if (gl_popups[i].popup)
+                gl_popup_detach(&gl_popups[i]);
+        log_msg("GL window %p destroyed", (void *)surface);
+    }
+    if (surface == gl_main)
+        gl_main = NULL;
+    for (i = 0; i < GL_POPUPS; i++) {
+        struct gl_popup *gp = &gl_popups[i];
+
+        if (gp->popup && gp->child == surface) {
+            if (gp->imported) {
+                if (gp->attached)
+                    wl_webos_imported_detach_surface(gp->imported, (struct wl_surface *)surface);
+                wl_webos_imported_destroy(gp->imported);
+                gp->imported = NULL;
+            }
+            gp->child = NULL;
+            gp->attached = 0;
+            gp->held_buffer = NULL;
+            gp->held_commit = 0;
+        }
+    }
+    gl_pending_drop(surface);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* The pop-up under x,y of the window, newest on top, and its origin. */
+static struct wl_surface *gl_hit(int32_t x, int32_t y, int32_t *ox, int32_t *oy)
+{
+    struct wl_surface *hit = NULL;
+    unsigned top = 0;
+    int i;
+
+    pthread_mutex_lock(&ov_mu);
+    for (i = 0; i < GL_POPUPS; i++) {
+        struct gl_popup *gp = &gl_popups[i];
+        int32_t x0 = gp->x + gp->off_x, y0 = gp->y + gp->off_y;
+
+        if (!gp->popup || !gp->attached || gp->seq < top)
+            continue;
+        if (x >= x0 && x < x0 + gp->w && y >= y0 && y < y0 + gp->h) {
+            hit = (struct wl_surface *)gp->popup;
+            top = gp->seq;
+            *ox = gp->x;
+            *oy = gp->y;
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return hit;
 }
 
 static void ov_surface_destroyed(struct wl_proxy *surface)
@@ -2078,7 +2638,10 @@ static void ov_commit(struct wl_proxy *surface)
         consumed = 1;
     }
     b = ov_buf_find(it->current);
-    if (!consumed && flat_mode()) {
+    if (gl_mode()) {
+        /* Nothing is composed: the compositor shows the GL window and the
+         * attached pop-up surfaces; this one only gets its buffer back. */
+    } else if (!consumed && flat_mode()) {
         /* No new buffer: the surface still shows the picture copied when its
          * buffer was attached. That buffer went back to the client right
          * after the copy (flat_releases), and the client may be drawing its
@@ -2177,7 +2740,7 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
      * the window's. The window is made now if need be and a frame of it
      * committed, so the client's picture goes out before the answer. */
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_FRAME && flat_mode() &&
-        proxy != (struct wl_proxy *)ov_surface) {
+        proxy != (struct wl_proxy *)ov_surface && !gl_passthrough(proxy)) {
         created = new_virt(proxy, interface ? interface : &wl_callback_interface, 1, V_FRAME,
                            NULL);
         if (created) {
@@ -2195,19 +2758,28 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
     }
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH) {
         ov_attach(proxy, (struct wl_proxy *)args[0].o);
+        if (gl_mode() && (gl_window_commit(proxy, args[0].o != NULL) ||
+                          gl_held(proxy, opcode, args))) {
+            *out = NULL;
+            return 1;
+        }
         if (flat_hidden(proxy)) {
             *out = NULL;
             return 1;
         }
     } else if (!strcmp(name, "wl_surface") &&
                (opcode == WL_SURFACE_DAMAGE || opcode == WL_SURFACE_DAMAGE_BUFFER)) {
-        if (flat_hidden(proxy)) {
+        if (flat_hidden(proxy) || (gl_mode() && gl_held(proxy, opcode, args))) {
             *out = NULL;
             return 1;
         }
     } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_COMMIT) {
         layered_commit(proxy);
         ov_commit(proxy);
+        if (gl_mode() && (gl_window_commit(proxy, -1) || gl_held(proxy, opcode, args))) {
+            *out = NULL;
+            return 1;
+        }
         if (flat_hidden(proxy)) {
             *out = NULL;
             return 1;
@@ -2403,6 +2975,9 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
                 }
             } else if (!our_subcompositor && ov_enabled() && v->wl_surface) {
                 ov_popup_at(v->wl_surface, child->abs_x, child->abs_y);
+                if (gl_mode())
+                    gl_popup_place(v->wl_surface, child->abs_x, child->abs_y, child->p_w,
+                                   child->p_h);
             }
             log_msg("popup surface=%p sub=%p at %d,%d %dx%d parent=%p",
                     (void *)child->wl_surface,
@@ -2426,8 +3001,11 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
             place_popup(v, pos);
             v->abs_x += v->popup_x - old_x;
             v->abs_y += v->popup_y - old_y;
-            if (!v->subsurface && ov_is_popup(v->wl_surface))
+            if (!v->subsurface && ov_is_popup(v->wl_surface)) {
                 ov_popup_at(v->wl_surface, v->abs_x, v->abs_y);
+                if (gl_mode())
+                    gl_popup_place(v->wl_surface, v->abs_x, v->abs_y, v->p_w, v->p_h);
+            }
             if (v->subsurface)
                 wl_subsurface_set_position(v->subsurface, v->popup_x, v->popup_y);
 
@@ -2438,6 +3016,8 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
     }
     if (v->kind == V_TOPLEVEL && opcode == XDG_TOPLEVEL_SET_TITLE && args && args[0].s) {
         int i;
+        if (gl_webos)
+            wl_webos_shell_surface_set_property(gl_webos, "title", args[0].s);
         for (i = 0; i < MAX_VIRT; i++) {
             if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == v->wl_surface &&
                 g.virts[i].webos_surface) {
@@ -2916,7 +3496,8 @@ static void show_keyboard(void)
     text_model_send(TM_ENTER_KEY_TYPE, 3);
     text_model_set_surrounding_text(text_input, "", 0, 0);
     text_model_activate(text_input, ++g.serial, our_seat,
-                        flat_mode() && ov_surface ? ov_surface : main_surface);
+                        gl_mode() && gl_window ? (struct wl_surface *)gl_window
+                        : flat_mode() && ov_surface ? ov_surface : main_surface);
     text_model_send(TM_SHOW_PANEL, 0);
     keyboard_up = 1;
     log_msg("keyboard shown");
@@ -3162,8 +3743,10 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
-    /* On the pop-up overlay: GTK is told about the pop-up under the pointer. */
-    ov_ptr_on = ov_surface && surface == ov_surface;
+    /* On the pop-up overlay or the GL window, GTK is told about the
+     * pop-up under the pointer. */
+    ov_ptr_on = (ov_surface && surface == ov_surface) ||
+                (gl_mode() && surface == (struct wl_surface *)gl_popup_of_child(NULL));
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
         struct wl_surface *hit;
@@ -3175,7 +3758,7 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
             x = (wl_fixed_t)((int64_t)x * ov_w / 1920);
             y = (wl_fixed_t)((int64_t)y * ov_h / 1080);
         }
-        hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
+        hit = gl_mode() ? gl_hit(x >> 8, y >> 8, &ox, &oy) : ov_hit(x >> 8, y >> 8, &ox, &oy);
         ov_ptr_serial = serial;
         ov_ptr_popup = hit;
         ov_ptr_x = ox;
@@ -3188,6 +3771,8 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         if (hit && orig && orig->enter)
             orig->enter(data, pointer, serial, hit, x - wl_fixed_from_int(ox),
                         y - wl_fixed_from_int(oy));
+        else if (!hit && gl_mode() && main_surface && orig && orig->enter)
+            orig->enter(data, pointer, serial, main_surface, x, y);
         return;
     }
     surface = input_surface(surface);
@@ -3207,9 +3792,12 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
-    if (ov_surface && surface == ov_surface) {
+    if ((ov_surface && surface == ov_surface) ||
+        (gl_mode() && surface == (struct wl_surface *)gl_popup_of_child(NULL))) {
         if (ov_ptr_popup && orig && orig->leave)
             orig->leave(data, pointer, serial, ov_ptr_popup);
+        else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
+            orig->leave(data, pointer, serial, main_surface);
         ov_ptr_popup = NULL;
         ov_ptr_on = 0;
         return;
@@ -3234,15 +3822,20 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     note_real_pointer();
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
-        struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
+        struct wl_surface *hit = gl_mode() ? gl_hit(x >> 8, y >> 8, &ox, &oy)
+                                           : ov_hit(x >> 8, y >> 8, &ox, &oy);
 
         if (hit != ov_ptr_popup) {
             log_msg("POINTER on pop-up %p at %d,%d", (void *)hit, last_x, last_y);
             if (ov_ptr_popup && orig && orig->leave)
                 orig->leave(data, pointer, ov_ptr_serial, ov_ptr_popup);
+            else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
+                orig->leave(data, pointer, ov_ptr_serial, main_surface);
             if (hit && orig && orig->enter)
                 orig->enter(data, pointer, ov_ptr_serial, hit, x - wl_fixed_from_int(ox),
                             y - wl_fixed_from_int(oy));
+            else if (!hit && gl_mode() && main_surface && orig && orig->enter)
+                orig->enter(data, pointer, ov_ptr_serial, main_surface, x, y);
             ov_ptr_popup = hit;
             ov_ptr_x = ox;
             ov_ptr_y = oy;
@@ -3250,6 +3843,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         if (hit && orig && orig->motion)
             orig->motion(data, pointer, time, x - wl_fixed_from_int(ov_ptr_x),
                          y - wl_fixed_from_int(ov_ptr_y));
+        else if (!hit && gl_mode() && orig && orig->motion)
+            orig->motion(data, pointer, time, x, y);
         return;
     }
     if (orig && orig->motion)
@@ -3685,6 +4280,8 @@ static int is_popup_surface(struct wl_surface *surface)
 
     if (!surface)
         return 0;
+    if (gl_mode() && gl_popup_find((struct wl_proxy *)surface))
+        return 1;
     for (i = 0; i < MAX_VIRT; i++) {
         if (g.virts[i].proxy && g.virts[i].kind == V_POPUP &&
             g.virts[i].subsurface &&
@@ -4246,6 +4843,8 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
 
         if (slot >= 0)
             forget_slot(slot);
+        if (gl_mode())
+            gl_surface_destroyed(proxy);
         forget_shell_role(proxy);
         if (ov_enabled())
             ov_surface_destroyed(proxy);

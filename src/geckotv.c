@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "media-helper.h"
@@ -246,6 +247,7 @@ int main(int argc, char **argv)
     int narg = 0;
     ssize_t n;
     char *slash;
+    int gl_window_mode = 0;
 
     if (argc > 1 && strcmp(argv[1], "--media-helper") == 0)
         return media_helper_main(argc, argv);
@@ -481,6 +483,7 @@ int main(int argc, char **argv)
             software = flat == 1 && !wegl;
         if (!software && flat == 1) {
             gl = 1;
+            gl_window_mode = 1;
             setenv("WEBOS_XDG_GL", "1", 1);
             setenv("WEBOS_XDG_SIZE", "1920x1080", 0);
         } else {
@@ -496,6 +499,52 @@ int main(int argc, char **argv)
                     gl ? ", GL window mode" : "");
         } else {
             fprintf(stderr, "geckotv: compositor not reachable before start; rendering left as is\n");
+        }
+    }
+
+    /* Hardware video (src/media-helper.cc, findings.md section 21) in GL
+     * window mode on a TV with LG's Starfish pipeline library. Firefox's
+     * media engine starts the helper itself and the adapter listens on the
+     * socket for the video's place. GECKOTV_HWVIDEO=0|1 in the env file
+     * overrides. The socket lives in the profile folder under a name no
+     * other process knows, and only the app's user can read that folder. */
+    {
+        const char *forced = getenv("GECKOTV_HWVIDEO");
+        int starfish = access("/usr/lib/libplayerAPIs.so.1", R_OK) == 0;
+        int on = forced && forced[0] ? atoi(forced) != 0 : gl_window_mode && starfish;
+        DIR *dir = opendir(home);
+
+        if (dir) {
+            struct dirent *ent;
+
+            while ((ent = readdir(dir)) != NULL)
+                if (strncmp(ent->d_name, ".geckotv-video-", 15) == 0) {
+                    snprintf(marker, sizeof marker, "%s/%s", home, ent->d_name);
+                    unlink(marker);
+                }
+            closedir(dir);
+        }
+        if (on) {
+            unsigned tag = (unsigned)time(NULL) ^ ((unsigned)getpid() << 16);
+            int rfd = open("/dev/urandom", O_RDONLY);
+
+            if (rfd >= 0) {
+                if (read(rfd, &tag, sizeof tag) != (ssize_t)sizeof tag)
+                    tag ^= (unsigned)getpid();
+                close(rfd);
+            }
+            snprintf(marker, sizeof marker, "%s/.geckotv-video-%08x", home, tag);
+            setenv("GECKOTV_MEDIA_HELPER", exe, 1);
+            setenv("GECKOTV_VIDEO_SOCKET", marker, 1);
+            fprintf(stderr, "geckotv: hardware video on (%s)\n",
+                    forced && forced[0] ? "GECKOTV_HWVIDEO" : "GL window mode and Starfish present");
+        } else {
+            unsetenv("GECKOTV_MEDIA_HELPER");
+            unsetenv("GECKOTV_VIDEO_SOCKET");
+            fprintf(stderr, "geckotv: hardware video off (%s)\n",
+                    forced && forced[0] ? "GECKOTV_HWVIDEO"
+                    : !starfish        ? "no libplayerAPIs.so.1"
+                                       : "not in GL window mode");
         }
     }
 

@@ -249,7 +249,7 @@ static struct wl_display *wake_display;
 static int wake_pending_flag;
 
 static void show_keyboard(void);
-static void hide_keyboard(void);
+static int hide_keyboard(void);
 static void keyboard_closed(void);
 static void text_input_enter_main(void);
 static void ensure_text_model(void);
@@ -938,6 +938,26 @@ static int clicked_recently(void)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - last_click.tv_sec) * 1000 +
            (now.tv_nsec - last_click.tv_nsec) / 1000000 < 1500;
+}
+
+/* When the Back key read from evdev closed the webOS keyboard. The same
+ * press may also arrive through wl_keyboard and must do nothing more. */
+static struct timespec back_hid_keyboard;
+
+static void note_back_hid_keyboard(void)
+{
+    clock_gettime(CLOCK_MONOTONIC, &back_hid_keyboard);
+}
+
+static int back_hid_keyboard_recently(void)
+{
+    struct timespec now;
+
+    if (back_hid_keyboard.tv_sec == 0)
+        return 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - back_hid_keyboard.tv_sec) * 1000 +
+           (now.tv_nsec - back_hid_keyboard.tv_nsec) / 1000000 < 500;
 }
 
 /* GTK only enables text input on a surface it has been told it entered. */
@@ -3896,10 +3916,10 @@ static void show_keyboard(void)
  * asks, so Back, a click outside the address bar, and text_leave all land
  * here. Deactivating as well as hiding stops the IME reopening it on the
  * next focus event. */
-static void hide_keyboard(void)
+static int hide_keyboard(void)
 {
     if (!text_input || !keyboard_up)
-        return;
+        return 0;
     text_model_send(TM_HIDE_PANEL, 0);
     if (our_seat)
         text_model_deactivate(text_input, our_seat);
@@ -3913,6 +3933,7 @@ static void hide_keyboard(void)
     text_input = NULL;
     keyboard_closed();
     log_msg("keyboard hidden");
+    return 1;
 }
 
 static void text_commit_string(void *data, struct text_model *model, uint32_t serial,
@@ -4385,7 +4406,8 @@ static void apply_remote_event(struct ptr_ev ev)
     /* Back, read straight from evdev so it works even while the IME
      * panel holds Wayland focus. */
     if (ev.button == -3) {
-        hide_keyboard();
+        if (hide_keyboard())
+            note_back_hid_keyboard();
         return;
     }
     /* The compositor closes the window when it sees this notch.
@@ -4928,7 +4950,7 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
  * that opens the previous page. */
 static uint32_t back_key_code(void)
 {
-    if (keyboard_up) {
+    if (keyboard_up || back_hid_keyboard_recently()) {
         hide_keyboard();
         log_trace("back: keyboard");
         return 0;

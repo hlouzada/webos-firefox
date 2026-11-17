@@ -88,6 +88,19 @@ int main(void)
     keyboard_key(NULL, kb, ++g.serial, 0, KEY_BACK, WL_KEYBOARD_KEY_STATE_RELEASED);
     CHECK(passed_as(KEY_ESC), "the release matches the press when the menu closes in between");
 
+    keyboard_up = 1;
+    press(kb, KEY_BACK);
+    CHECK(got == 0, "Back while the webOS keyboard is up: swallowed");
+    keyboard_up = 0;
+
+    note_back_hid_keyboard();
+    press(kb, KEY_BACK);
+    CHECK(got == 0, "Back just after the evdev Back closed the keyboard: swallowed");
+
+    back_hid_keyboard.tv_sec -= 2;
+    press(kb, KEY_BACK);
+    CHECK(passed_as(KEY_BACK), "and two seconds later: the previous page");
+
     printf("%d failure(s)\n", failures);
     return failures != 0;
 }

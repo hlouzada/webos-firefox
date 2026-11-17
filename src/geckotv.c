@@ -462,16 +462,34 @@ int main(int argc, char **argv)
         int flat = flat_mode_compositor();
         int software;
 
+        /* A flat-mode compositor shows what the GPU draws only through the
+         * adapter's GL window mode (src/webos-xdg.c, gl_mode). That mode
+         * needs the TV's own wayland-egl library for the Mali driver. */
+        int wegl = access("/usr/lib/libwayland-egl.so.1", F_OK) == 0 ||
+                   access("/usr/lib/libwayland-egl.so.0", F_OK) == 0 ||
+                   access("/lib/libwayland-egl.so.1", F_OK) == 0 ||
+                   access("/lib/libwayland-egl.so.0", F_OK) == 0;
+        int gl = 0;
+
         if (forced && forced[0])
             software = atoi(forced) != 0;
         else
-            software = flat == 1;
+            software = flat == 1 && !wegl;
+        if (!software && flat == 1) {
+            gl = 1;
+            setenv("WEBOS_XDG_GL", "1", 1);
+            setenv("WEBOS_XDG_SIZE", "1920x1080", 0);
+        } else {
+            unsetenv("WEBOS_XDG_GL");
+        }
         if (flat >= 0 || (forced && forced[0])) {
             set_software_rendering(home, software);
-            fprintf(stderr, "geckotv: %s rendering (%s)\n", software ? "software" : "GPU",
+            fprintf(stderr, "geckotv: %s rendering (%s)%s\n", software ? "software" : "GPU",
                     forced && forced[0] ? "GECKOTV_SOFTWARE"
-                    : flat == 1        ? "flat-mode compositor"
-                                       : "compositor has wl_subcompositor or no wl_webos_foreign");
+                    : flat != 1         ? "compositor has wl_subcompositor or no wl_webos_foreign"
+                    : wegl              ? "flat-mode compositor with wayland-egl"
+                                        : "flat-mode compositor without wayland-egl",
+                    gl ? ", GL window mode" : "");
         } else {
             fprintf(stderr, "geckotv: compositor not reachable before start; rendering left as is\n");
         }

@@ -10,6 +10,11 @@ SYSROOT := $(TC)/arm-webos-linux-gnueabi/sysroot
 
 CFLAGS := --sysroot=$(SYSROOT) -O2 -Wall -Wextra -std=c11
 LDFLAGS := --sysroot=$(SYSROOT) -lwayland-webos-client -lwayland-client -lwayland-egl -lEGL -lGLESv2 -lm -ldl
+# The SDK's own wayland-scanner generates code that calls only functions the
+# TV's libwayland-client (1.11 on webOS 4) has. Newer scanners emit
+# wl_proxy_marshal_flags and those libraries lack it.
+SCANNER := $(TC)/bin/wayland-scanner
+GEN := build/gen
 
 .PHONY: all package clean icons
 
@@ -18,6 +23,19 @@ all: app/smoke app/geckotv
 app/smoke: src/smoke.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 	chmod 755 $@
+
+$(GEN)/wayland-webos-shell-client-protocol.h: src/webos-shell.xml
+	mkdir -p $(GEN)
+	$(SCANNER) client-header $< $@
+$(GEN)/webos-shell-protocol.c: src/webos-shell.xml
+	mkdir -p $(GEN)
+	$(SCANNER) private-code $< $@
+$(GEN)/webos-foreign-client-protocol.h: src/webos-foreign.xml
+	mkdir -p $(GEN)
+	$(SCANNER) client-header $< $@
+$(GEN)/webos-foreign-protocol.c: src/webos-foreign.xml
+	mkdir -p $(GEN)
+	$(SCANNER) private-code $< $@
 
 app/geckotv: src/geckotv.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
@@ -31,3 +49,4 @@ package: all
 
 clean:
 	rm -f app/smoke app/geckotv dist/*.ipk
+	rm -rf $(GEN)

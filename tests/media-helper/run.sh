@@ -55,6 +55,13 @@ check "flush at SEEK, Seek(5000) right before the next video feed" \
 check "SEEKDONE and a new frame after the seek, time at 5 s" \
     '[ $(( $(field seek after-seek flags) & 36 )) = 36 ] && [ "$(field seek after-seek time)" -ge 5000000 ]'
 
+echo "== reload: UNLOAD drops the pipeline, LOAD brings it back at another time"
+run reload
+check "UNLOAD answers OK without the PIPELINE flag; unload and dtor on the library" \
+    '[ "$(field reload unload result)" = 0 ] && [ $(( $(field reload unload flags) & 1 )) = 0 ] && grep -q " unload" "$BUILD/reload.stub" && grep -q " dtor" "$BUILD/reload.stub"'
+check "second Load on a new object at 7 s, playing resumes with a frame there" \
+    '[ "$(grep -c " ctor" "$BUILD/reload.stub")" = 2 ] && grep -q "load .*\"ptsToDecode\":7000000000" "$BUILD/reload.stub" && [ $(( $(field reload after-reload flags) & 5 )) = 5 ] && [ "$(field reload after-reload time)" -ge 7000000 ]'
+
 echo "== retry: BufferFull is reported, not fatal"
 run retry STUB_BUFFER_FULL_AT=3
 check "third feed answers RETRY, the repeat answers OK" \

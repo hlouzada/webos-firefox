@@ -223,7 +223,8 @@ int main(int argc, char **argv)
         show("feed3", r);
         r = feed(GM_TRACK_VIDEO, 80000, 0);
         show("feed3-again", r);
-    } else if (!strcmp(scenario, "play") || !strcmp(scenario, "seek")) {
+    } else if (!strcmp(scenario, "play") || !strcmp(scenario, "seek") ||
+               !strcmp(scenario, "reload")) {
         r = open_stream(GM_VIDEO_H264, 1, "w123");
         show("open", r);
         args[0] = 50;
@@ -245,6 +246,18 @@ int main(int argc, char **argv)
             r = feed(GM_TRACK_VIDEO, 5040000, 0);
             r = wait_for(GM_F_HAS_FRAME | GM_F_SEEKDONE, 0, 3000);
             show("after-seek", r);
+        } else if (!strcmp(scenario, "reload")) {
+            r = simple(GM_UNLOAD, 3000);
+            show("unload", r);
+            r = request(GM_LOAD, NULL, 7000000, NULL, 0, 10000);
+            show("reload", r);
+            r = wait_for(GM_F_PIPELINE, 0, 3000);
+            show("pipeline-again", r);
+            r = feed(GM_TRACK_VIDEO, 7000000, 1);
+            show("feed-after-reload", r);
+            r = feed(GM_TRACK_VIDEO, 7040000, 0);
+            r = wait_for(GM_F_HAS_FRAME, 0, 3000);
+            show("after-reload", r);
         } else {
             args[0] = GM_TRACK_VIDEO;
             r = request(GM_EOS, args, 0, NULL, 0, 3000);

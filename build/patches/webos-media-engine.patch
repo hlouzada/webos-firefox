@@ -1,0 +1,2224 @@
+diff --git a/dom/media/ChannelMediaDecoder.cpp b/dom/media/ChannelMediaDecoder.cpp
+index c9b799cf07..30ef7d48f9 100644
+--- a/dom/media/ChannelMediaDecoder.cpp
++++ b/dom/media/ChannelMediaDecoder.cpp
+@@ -3,6 +3,9 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ChannelMediaDecoder.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ 
+ #include "BaseMediaResource.h"
+ #include "ChannelMediaResource.h"
+@@ -234,6 +237,11 @@ ChannelMediaDecoder::CreateStateMachine(bool aDisableExternalEngine) {
+       !aDisableExternalEngine) {
+     return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
+   }
++#endif
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  if (WebOSEngine::IsAvailable() && !aDisableExternalEngine) {
++    return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
++  }
+ #endif
+   return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
+ }
+diff --git a/dom/media/ExternalEngineStateMachine.cpp b/dom/media/ExternalEngineStateMachine.cpp
+index 2b0ef73252..d8871f85eb 100644
+--- a/dom/media/ExternalEngineStateMachine.cpp
++++ b/dom/media/ExternalEngineStateMachine.cpp
+@@ -13,6 +13,9 @@
+ #ifdef MOZ_WMF_CDM
+ #  include "mozilla/EMEUtils.h"
+ #endif
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ #include "VideoUtils.h"
+ #include "mozilla/AppShutdown.h"
+ #include "mozilla/Atomics.h"
+@@ -231,6 +234,9 @@ void ExternalEngineStateMachine::InitEngine() {
+   MOZ_ASSERT(mState.IsInitEngine() || mState.IsRecoverEngine());
+ #ifdef MOZ_WMF_MEDIA_ENGINE
+   mEngine.reset(new MFMediaEngineWrapper(this, mFrameStats));
++#endif
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  mEngine.reset(new WebOSEngine(this));
+ #endif
+   if (mEngine) {
+     MOZ_ASSERT(mInfo);
+@@ -273,6 +279,9 @@ void ExternalEngineStateMachine::OnEngineInitSuccess() {
+   mReader->UpdateMediaEngineId(mEngine->Id());
+   state->mInitPromise = nullptr;
+   mIsEngineReady = true;
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  mRendersOnExternalPlane = mInfo && mInfo->HasVideo();
++#endif
+   if (mState.IsInitEngine()) {
+     StartRunningEngine();
+     return;
+@@ -412,6 +421,12 @@ bool ExternalEngineStateMachine::IsFormatSupportedByExternalEngine(
+       aInfo.HasAudio() ? aInfo.mAudio.mMimeType.get() : "none", audioSupported,
+       aInfo.HasVideo() ? aInfo.mVideo.mMimeType.get() : "none", videoSupported);
+   return audioSupported && videoSupported;
++#elif defined(MOZ_WEBOS_MEDIA_ENGINE)
++  const bool supported = WebOSEngine::SupportsFormat(aInfo);
++  LOG("audio=%s, video=%s, webOS engine supported=%d",
++      aInfo.HasAudio() ? aInfo.mAudio.mMimeType.get() : "none",
++      aInfo.HasVideo() ? aInfo.mVideo.mMimeType.get() : "none", supported);
++  return supported;
+ #else
+   return false;
+ #endif
+@@ -679,6 +694,7 @@ RefPtr<ShutdownPromise> ExternalEngineStateMachine::Shutdown() {
+ 
+   LOG("Shutdown");
+   mIsEngineReady = false;
++  mRendersOnExternalPlane = false;
+   ChangeStateTo(State::ShutdownEngine);
+   ResetDecode();
+ 
+@@ -1043,11 +1059,18 @@ void ExternalEngineStateMachine::OnRequestVideo() {
+                 "ExternalEngineStateMachine::OnRequestVideo:Resolved",
+                 MEDIA_PLAYBACK);
+             MOZ_ASSERT(aVideo);
+-            if (!mHasReceivedFirstDecodedVideoFrame) {
++            const bool firstFrame = !mHasReceivedFirstDecodedVideoFrame;
++            if (firstFrame) {
+               mHasReceivedFirstDecodedVideoFrame = true;
+               OnLoadedFirstFrame();
+             }
+             RunningEngineUpdate(MediaData::Type::VIDEO_DATA);
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++            // The plane shows the frames, so the element only needs the size.
++            if (!firstFrame) {
++              return;
++            }
++#endif
+             // Send image to PIP window.
+             if (mSecondaryVideoContainer.Ref()) {
+               mSecondaryVideoContainer.Ref()->SetCurrentFrame(
+@@ -1299,6 +1322,7 @@ void ExternalEngineStateMachine::NotifyErrorInternal(
+   LOG("Engine error: %s", aError.Description().get());
+   PROFILER_MARKER_TEXT("EESM::NotifyErrorInternal", MEDIA_PLAYBACK, {},
+                        aError.Description());
++  mRendersOnExternalPlane = false;
+   if (mState.IsRecoverEngine()) {
+     // Suppress errors that arrive during engine recovery to avoid
+     // interrupting the in-progress reinit sequence.
+@@ -1589,6 +1613,13 @@ void ExternalEngineStateMachine::ReportTelemetry(const MediaResult& aError) {
+   }
+ }
+ 
++void ExternalEngineStateMachine::SetVideoPlaneRect(const gfx::IntRect& aRect) {
++  AssertOnTaskQueue();
++  if (mEngine && mIsEngineReady) {
++    mEngine->SetVideoRect(aRect);
++  }
++}
++
+ void ExternalEngineStateMachine::DecodeError(const MediaResult& aError) {
+   if (aError != NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA ||
+       aError != NS_ERROR_DOM_MEDIA_CANCELED) {
+diff --git a/dom/media/ExternalEngineStateMachine.h b/dom/media/ExternalEngineStateMachine.h
+index 17f7186140..112cb9bd17 100644
+--- a/dom/media/ExternalEngineStateMachine.h
++++ b/dom/media/ExternalEngineStateMachine.h
+@@ -8,6 +8,7 @@
+ #include "MediaDecoderStateMachineBase.h"
+ #include "SeekJob.h"
+ #include "mozilla/Variant.h"
++#include "mozilla/gfx/Rect.h"
+ 
+ namespace mozilla {
+ 
+@@ -129,6 +130,11 @@ class ExternalEngineStateMachine final
+ 
+   bool IsExternalEngineStateMachine() const override { return true; }
+ 
++  bool RendersOnExternalPlane() const override {
++    return mRendersOnExternalPlane;
++  }
++  void SetVideoPlaneRect(const gfx::IntRect& aRect) override;
++
+  private:
+   ~ExternalEngineStateMachine();
+ 
+@@ -372,6 +378,10 @@ class ExternalEngineStateMachine final
+ 
+   bool mHasFatalError = false;
+ 
++  // Set once the engine runs with video, read from the main thread by the
++  // video element to paint a hole for the plane.
++  Atomic<bool> mRendersOnExternalPlane{false};
++
+   // Set when the engine has been fully initialized (in OnEngineInitSuccess)
+   // and cleared on recovery (crash or hardware reset). Used to defer
+   // operations that require a ready engine.
+@@ -412,6 +422,9 @@ class ExternalPlaybackEngine {
+   virtual void NotifyEndOfStream(TrackInfo::TrackType aType) = 0;
+   virtual bool SetCDMProxy(CDMProxy* aProxy) = 0;
+   virtual void NotifyResizing(uint32_t aWidth, uint32_t aHeight) = 0;
++  // Where the video element is on screen, in window device pixels, or empty
++  // when it is not shown. For engines that place a plane under the window.
++  virtual void SetVideoRect(const gfx::IntRect& aRect) {}
+ 
+   ExternalEngineStateMachine* const MOZ_NON_OWNING_REF mOwner;
+ };
+diff --git a/dom/media/MediaDecoder.cpp b/dom/media/MediaDecoder.cpp
+index 37ba39bf01..3e3f4467f3 100644
+--- a/dom/media/MediaDecoder.cpp
++++ b/dom/media/MediaDecoder.cpp
+@@ -379,9 +379,21 @@ bool MediaDecoder::IsVideoDecodingSuspended() const {
+   return mIsVideoDecodingSuspended;
+ }
+ 
++bool MediaDecoder::RendersOnExternalPlane() const {
++  MOZ_ASSERT(NS_IsMainThread());
++  return mDecoderStateMachine && mDecoderStateMachine->RendersOnExternalPlane();
++}
++
++void MediaDecoder::SetVideoPlaneRect(const gfx::IntRect& aRect) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (mDecoderStateMachine) {
++    mDecoderStateMachine->DispatchSetVideoPlaneRect(aRect);
++  }
++}
++
+ void MediaDecoder::OnPlaybackErrorEvent(const MediaResult& aError) {
+   MOZ_ASSERT(NS_IsMainThread());
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   if (aError == NS_ERROR_DOM_MEDIA_EXTERNAL_ENGINE_NOT_SUPPORTED_ERR ||
+       aError == NS_ERROR_DOM_MEDIA_CDM_PROXY_NOT_SUPPORTED_ERR) {
+     (void)SwitchStateMachine(aError);
+@@ -391,7 +403,7 @@ void MediaDecoder::OnPlaybackErrorEvent(const MediaResult& aError) {
+   DecodeError(aError);
+ }
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+ bool MediaDecoder::SwitchStateMachine(const MediaResult& aError) {
+   MOZ_ASSERT(aError == NS_ERROR_DOM_MEDIA_EXTERNAL_ENGINE_NOT_SUPPORTED_ERR ||
+              aError == NS_ERROR_DOM_MEDIA_CDM_PROXY_NOT_SUPPORTED_ERR);
+@@ -742,14 +754,14 @@ void MediaDecoder::MetadataLoaded(
+   // the media element has the latest dimensions.
+   Invalidate();
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   SetStatusUpdateForNewlyCreatedStateMachineIfNeeded();
+ #endif
+ 
+   EnsureTelemetryReported();
+ }
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+ void MediaDecoder::SetStatusUpdateForNewlyCreatedStateMachineIfNeeded() {
+   if (!mPendingStatusUpdateForNewlyCreatedStateMachine) {
+     return;
+@@ -761,6 +773,13 @@ void MediaDecoder::SetStatusUpdateForNewlyCreatedStateMachineIfNeeded() {
+   if (mLogicallySeeking) {
+     Seek(mLogicalPosition, SeekTarget::Accurate);
+   }
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // When the engine hands over mid-playback because of a playback rate it
++  // cannot do, the state machine that takes over starts at that position.
++  else if (mLogicalPosition > 0) {
++    Seek(mLogicalPosition, SeekTarget::Accurate);
++  }
++#endif
+   if (mPlaybackRate != 0 && mPlaybackRate != 1.0) {
+     mDecoderStateMachine->DispatchSetPlaybackRate(mPlaybackRate);
+   }
+diff --git a/dom/media/MediaDecoder.h b/dom/media/MediaDecoder.h
+index 98d4e9bffc..3a4757d940 100644
+--- a/dom/media/MediaDecoder.h
++++ b/dom/media/MediaDecoder.h
+@@ -385,6 +385,12 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+ 
+   bool IsVideoDecodingSuspended() const;
+ 
++  // True while an external engine shows the video on a plane under the
++  // window. The video element then paints a hole instead of frames.
++  bool RendersOnExternalPlane() const;
++  // Where the video element is on screen, in window device pixels.
++  void SetVideoPlaneRect(const gfx::IntRect& aRect);
++
+ #  ifdef MOZ_WMF_CDM
+   // [TEST-ONLY] Returns true if WMFClearKey CDM is active. The media engine
+   // renders frames internally via OnVideoStreamTick() in this mode, so no
+@@ -555,7 +561,7 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+   // double.
+   Variant<media::TimeUnit, double> mDuration;
+ 
+-#  ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   // True when we need to update the newly created MDSM's status to make it
+   // consistent with the previous destroyed one.
+   bool mPendingStatusUpdateForNewlyCreatedStateMachine = false;
+@@ -596,7 +602,7 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
+ 
+   void ConnectMirrors();
+   void DisconnectMirrors();
+-#  ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   // Return true if we switched to a new state machine.
+   bool SwitchStateMachine(const MediaResult& aError);
+ #  endif
+diff --git a/dom/media/MediaDecoderStateMachineBase.cpp b/dom/media/MediaDecoderStateMachineBase.cpp
+index 9ca7949c7c..fb553f5e90 100644
+--- a/dom/media/MediaDecoderStateMachineBase.cpp
++++ b/dom/media/MediaDecoderStateMachineBase.cpp
+@@ -89,6 +89,13 @@ void MediaDecoderStateMachineBase::DispatchSetPlaybackRate(
+       &MediaDecoderStateMachineBase::SetPlaybackRate, aPlaybackRate));
+ }
+ 
++void MediaDecoderStateMachineBase::DispatchSetVideoPlaneRect(
++    const gfx::IntRect& aRect) {
++  OwnerThread()->Dispatch(NewRunnableMethod<gfx::IntRect>(
++      "MediaDecoderStateMachineBase::SetVideoPlaneRect", this,
++      &MediaDecoderStateMachineBase::SetVideoPlaneRect, aRect));
++}
++
+ nsresult MediaDecoderStateMachineBase::Init(MediaDecoder* aDecoder) {
+   MOZ_ASSERT(NS_IsMainThread());
+ 
+diff --git a/dom/media/MediaDecoderStateMachineBase.h b/dom/media/MediaDecoderStateMachineBase.h
+index ac3066049e..195a7bae09 100644
+--- a/dom/media/MediaDecoderStateMachineBase.h
++++ b/dom/media/MediaDecoderStateMachineBase.h
+@@ -7,6 +7,7 @@
+ 
+ #include "DecoderDoctorDiagnostics.h"
+ #include "MediaDecoder.h"
++#include "mozilla/gfx/Rect.h"
+ #include "MediaDecoderOwner.h"
+ #include "MediaEventSource.h"
+ #include "MediaInfo.h"
+@@ -171,6 +172,11 @@ class MediaDecoderStateMachineBase {
+   void DispatchCanPlayThrough(bool aCanPlayThrough);
+   void DispatchIsLiveStream(bool aIsLiveStream);
+   void DispatchSetPlaybackRate(double aPlaybackRate);
++  void DispatchSetVideoPlaneRect(const gfx::IntRect& aRect);
++
++  // True while an external engine shows the video on a plane under the
++  // window (webOS). Thread-safe.
++  virtual bool RendersOnExternalPlane() const { return false; }
+ 
+   virtual RefPtr<SetCDMPromise> SetCDMProxy(CDMProxy* aProxy);
+ 
+@@ -192,6 +198,7 @@ class MediaDecoderStateMachineBase {
+   const MediaInfo& Info() const { return mInfo.ref(); }
+ 
+   virtual void SetPlaybackRate(double aPlaybackRate) = 0;
++  virtual void SetVideoPlaneRect(const gfx::IntRect& aRect) {}
+   virtual void SetCanPlayThrough(bool aCanPlayThrough) = 0;
+   virtual void SetFragmentEndTime(const media::TimeUnit& aFragmentEndTime) = 0;
+ 
+diff --git a/dom/media/ipc/RemoteDecoderModule.cpp b/dom/media/ipc/RemoteDecoderModule.cpp
+index fff184abf1..1e06524c21 100644
+--- a/dom/media/ipc/RemoteDecoderModule.cpp
++++ b/dom/media/ipc/RemoteDecoderModule.cpp
+@@ -63,8 +63,9 @@ media::DecodeSupportSet RemoteDecoderModule::Supports(
+     DecoderDoctorDiagnostics* aDiagnostics) const {
+   bool supports =
+       RemoteMediaManagerChild::Supports(mLocation, aParams, aDiagnostics);
+-#ifdef MOZ_WMF_CDM
+-  // This should only be supported by mf media engine cdm process.
++#if defined(MOZ_WMF_CDM) || defined(MOZ_WEBOS_MEDIA_ENGINE)
++  // This should only be supported by mf media engine cdm process. On webOS
++  // the engine's decoders live in the content process.
+   if (aParams.mMediaEngineId &&
+       mLocation != RemoteMediaIn::UtilityProcess_MFMediaEngineCDM) {
+     supports = false;
+diff --git a/dom/media/mediaelement/HTMLMediaElement.cpp b/dom/media/mediaelement/HTMLMediaElement.cpp
+index 69922d2c5a..92a4717573 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.cpp
++++ b/dom/media/mediaelement/HTMLMediaElement.cpp
+@@ -8089,6 +8089,16 @@ MediaDecoderOwner::NextFrameStatus HTMLMediaElement::NextFrameStatus() {
+   return NEXT_FRAME_UNINITIALIZED;
+ }
+ 
++bool HTMLMediaElement::RendersOnExternalPlane() const {
++  return mDecoder && mDecoder->RendersOnExternalPlane();
++}
++
++void HTMLMediaElement::NotifyVideoPlaneRect(const gfx::IntRect& aRect) {
++  if (mDecoder) {
++    mDecoder->SetVideoPlaneRect(aRect);
++  }
++}
++
+ void HTMLMediaElement::SetDecoder(MediaDecoder* aDecoder) {
+   MOZ_ASSERT(aDecoder);  // Use ShutdownDecoder() to clear.
+   if (mDecoder) {
+diff --git a/dom/media/mediaelement/HTMLMediaElement.h b/dom/media/mediaelement/HTMLMediaElement.h
+index 74ec5b5edf..f4de51d00b 100644
+--- a/dom/media/mediaelement/HTMLMediaElement.h
++++ b/dom/media/mediaelement/HTMLMediaElement.h
+@@ -907,6 +907,14 @@ class HTMLMediaElement : public nsGenericHTMLElement,
+ 
+   void SetDecoder(MediaDecoder* aDecoder);
+ 
++ public:
++  // True while an external engine shows the video on a plane under the
++  // window. The video frame then paints a hole and reports its place.
++  bool RendersOnExternalPlane() const;
++  void NotifyVideoPlaneRect(const gfx::IntRect& aRect);
++
++ protected:
++
+   void PlayInternal(bool aHandlingUserInput);
+ 
+   // See spec, https://html.spec.whatwg.org/#internal-pause-steps
+diff --git a/dom/media/mediasource/MediaSourceDecoder.cpp b/dom/media/mediasource/MediaSourceDecoder.cpp
+index ee40a73fd4..e941f17fad 100644
+--- a/dom/media/mediasource/MediaSourceDecoder.cpp
++++ b/dom/media/mediasource/MediaSourceDecoder.cpp
+@@ -2,6 +2,9 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #include "MediaSourceDecoder.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ 
+ #include <algorithm>
+ 
+@@ -85,6 +88,12 @@ MediaSourceDecoder::CreateStateMachine(bool aDisableExternalEngine) {
+       !aDisableExternalEngine) {
+     return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
+   }
++#endif
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // Encrypted media is refused by the engine once the metadata is known.
++  if (WebOSEngine::IsAvailable() && !aDisableExternalEngine) {
++    return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
++  }
+ #endif
+   return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
+ }
+@@ -391,7 +400,7 @@ bool MediaSourceDecoder::HadCrossOriginRedirects() {
+   return false;
+ }
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+ void MediaSourceDecoder::MetadataLoaded(
+     UniquePtr<MediaInfo> aInfo, UniquePtr<MetadataTags> aTags,
+     MediaDecoderEventVisibility aEventVisibility) {
+diff --git a/dom/media/mediasource/MediaSourceDecoder.h b/dom/media/mediasource/MediaSourceDecoder.h
+index 1cf21c1f21..eafa8b902a 100644
+--- a/dom/media/mediasource/MediaSourceDecoder.h
++++ b/dom/media/mediasource/MediaSourceDecoder.h
+@@ -83,7 +83,7 @@ class MediaSourceDecoder : public MediaDecoder,
+   media::TimeInterval ClampIntervalToEnd(const media::TimeInterval& aInterval);
+   bool CanPlayThroughImpl() override;
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   void MetadataLoaded(UniquePtr<MediaInfo> aInfo, UniquePtr<MetadataTags> aTags,
+                       MediaDecoderEventVisibility aEventVisibility) override;
+ #endif
+diff --git a/dom/media/platforms/PDMFactory.cpp b/dom/media/platforms/PDMFactory.cpp
+index 6af74f901d..5fca8e771d 100644
+--- a/dom/media/platforms/PDMFactory.cpp
++++ b/dom/media/platforms/PDMFactory.cpp
+@@ -44,6 +44,9 @@
+ #ifdef MOZ_FFMPEG
+ #  include "FFmpegRuntimeLinker.h"
+ #endif
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngineDecoderModule.h"
++#endif
+ #ifdef MOZ_APPLEMEDIA
+ #  include "AppleDecoderModule.h"
+ #endif
+@@ -639,6 +642,11 @@ void PDMFactory::CreateUtilityPDMs() {
+ }
+ 
+ void PDMFactory::CreateContentPDMs() {
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // Takes only decoders made for a media engine. Everything else falls
++  // through to the modules below.
++  StartupPDM(WebOSEngineDecoderModule::Create());
++#endif
+   if (StaticPrefs::media_gpu_process_decoder()) {
+     StartupPDM(RemoteDecoderModule::Create(RemoteMediaIn::GpuProcess));
+   }
+diff --git a/dom/media/platforms/moz.build b/dom/media/platforms/moz.build
+index 1bd4af56f2..20f90f83f7 100644
+--- a/dom/media/platforms/moz.build
++++ b/dom/media/platforms/moz.build
+@@ -112,6 +112,19 @@ if CONFIG["MOZ_APPLEMEDIA"]:
+         "-Wl,-U,_VTRegisterSupplementalVideoDecoderIfAvailable",
+     ]
+ 
++if CONFIG["MOZ_WEBOS_MEDIA_ENGINE"]:
++    EXPORTS += [
++        "webos/WebOSEngine.h",
++        "webos/WebOSEngineDecoderModule.h",
++    ]
++    UNIFIED_SOURCES += [
++        "webos/WebOSEngine.cpp",
++        "webos/WebOSEngineDecoderModule.cpp",
++    ]
++    LOCAL_INCLUDES += [
++        "/dom/media/platforms/agnostic/bytestreams",
++    ]
++
+ include("/ipc/chromium/chromium-config.mozbuild")
+ 
+ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
+diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
+new file mode 100644
+index 0000000000..dfca0305af
+--- /dev/null
++++ b/dom/media/platforms/webos/WebOSEngine.cpp
+@@ -0,0 +1,986 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "WebOSEngine.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <string.h>
++#include <sys/resource.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cmath>
++#include <map>
++#include <thread>
++
++#include "Adts.h"
++#include "ImageContainer.h"
++#include "MP4Decoder.h"
++#include "MediaResult.h"
++#include "VPXDecoder.h"
++#include "VideoUtils.h"
++#include "mozilla/Logging.h"
++#include "mozilla/StaticMutex.h"
++#include "mozilla/StaticPrefs_media.h"
++#include "mozilla/gfx/2D.h"
++#include "nsPrintfCString.h"
++
++extern char** environ;
++
++namespace mozilla {
++
++static LazyLogModule sWebOSEngineLog("WebOSEngine");
++#define LOG(fmt, ...)                                             \
++  MOZ_LOG(sWebOSEngineLog, LogLevel::Debug,                       \
++          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
++#define LOGW(fmt, ...)                                           \
++  MOZ_LOG(sWebOSEngineLog, LogLevel::Warning,                    \
++          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
++#define LOGV(fmt, ...)                                           \
++  MOZ_LOG(sWebOSEngineLog, LogLevel::Verbose,                    \
++          ("WebOSEngine %" PRIu64 ": " fmt, mId, ##__VA_ARGS__))
++
++// Wire format shared with the helper, src/media-protocol.h in the app
++// repository. Keep the two in step.
++namespace {
++
++constexpr uint32_t kMagic = 0x4d565447u;
++constexpr uint32_t kMaxPayload = 16u * 1024u * 1024u;
++constexpr int kHelperFd = 3;
++
++enum MsgType : uint32_t {
++  GM_REPLY = 2,
++  GM_OPEN = 10,
++  GM_LOAD = 11,
++  GM_FEED = 12,
++  GM_SEEK = 13,
++  GM_PLAY = 14,
++  GM_PAUSE = 15,
++  GM_VOLUME = 16,
++  GM_EOS = 17,
++  GM_STATUS = 19,
++  GM_CLOSE = 20,
++  GM_UNLOAD = 21,
++};
++enum { GM_TRACK_VIDEO = 1, GM_TRACK_AUDIO = 2 };
++enum { GM_VIDEO_H264 = 1, GM_VIDEO_VP9 = 2 };
++enum { GM_AUDIO_NONE = 0, GM_AUDIO_AAC = 3 };
++enum { GM_OK = 0, GM_RETRY = 1, GM_UNSUPPORTED = 2, GM_ERROR = -1 };
++enum {
++  GM_F_PIPELINE = 1,
++  GM_F_LOADED = 2,
++  GM_F_HAS_FRAME = 4,
++  GM_F_ENDED = 8,
++  GM_F_FAILED = 16,
++  GM_F_SEEKDONE = 32,
++  GM_F_PLAYING = 64,
++};
++
++struct OpenPayload {
++  uint32_t audio_rate;
++  uint32_t audio_channels;
++  uint32_t audio_profile;
++  uint32_t audio_frequency_index;
++  char window_id[128];
++};
++
++constexpr int kTickMs = 25;
++constexpr int kReplyTimeoutMs = 3000;
++constexpr int kOpenTimeoutMs = 10000;
++constexpr int kTimeupdateIntervalUs = 100000;
++
++StaticMutex sChannelsMutex;
++std::map<uint64_t, WebOSEngineChannel*>* sChannels = nullptr;
++Atomic<uint64_t> sNextId(1);
++
++}  // namespace
++
++struct WebOSEngineChannel::Msg {
++  uint32_t magic;
++  uint32_t type;
++  uint32_t size;
++  uint32_t reserved;
++  int32_t arg[6];
++  int64_t time_us;
++};
++
++/* static */
++bool WebOSEngine::IsAvailable() {
++  const char* helper = getenv("GECKOTV_MEDIA_HELPER");
++  return StaticPrefs::media_webos_engine_enabled() && helper && helper[0];
++}
++
++/* static */
++bool WebOSEngine::SupportsFormat(const MediaInfo& aInfo) {
++  if (!aInfo.HasVideo() || aInfo.IsEncrypted()) {
++    return false;
++  }
++  const nsCString& v = aInfo.mVideo.mMimeType;
++  if (!MP4Decoder::IsH264(v) && !VPXDecoder::IsVP9(v)) {
++    return false;
++  }
++  if (aInfo.HasAudio() && !MP4Decoder::IsAAC(aInfo.mAudio.mMimeType)) {
++    return false;
++  }
++  return true;
++}
++
++/* static */
++bool WebOSEngine::SupportsCodecs(const MediaCodecs& aCodecs) {
++  for (const auto& codec : aCodecs.Range()) {
++    if (!IsH264CodecString(codec) && !IsVP9CodecString(codec) &&
++        !IsAACCodecString(codec)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++WebOSEngine::WebOSEngine(ExternalEngineStateMachine* aOwner)
++    : ExternalPlaybackEngine(aOwner), mChannel(new WebOSEngineChannel(aOwner)) {}
++
++WebOSEngine::~WebOSEngine() { mChannel->Shutdown(); }
++
++RefPtr<GenericNonExclusivePromise> WebOSEngine::Init(
++    const MediaInfo& aInfo, const InitFlagSet& aFlags) {
++  return mChannel->Init(aInfo);
++}
++
++void WebOSEngine::Shutdown() { mChannel->Shutdown(); }
++
++WebOSEngineChannel::WebOSEngineChannel(ExternalEngineStateMachine* aOwner)
++    : mId(sNextId++),
++      mOwner(aOwner),
++      mTaskQueue(TaskQueue::Create(
++          GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER),
++          "WebOSEngineChannel")),
++      mTimer(new MediaTimer<TimeStamp>()) {
++  StaticMutexAutoLock lock(sChannelsMutex);
++  if (!sChannels) {
++    sChannels = new std::map<uint64_t, WebOSEngineChannel*>();
++  }
++  (*sChannels)[mId] = this;
++}
++
++WebOSEngineChannel::~WebOSEngineChannel() {
++  Close();
++  StaticMutexAutoLock lock(sChannelsMutex);
++  if (sChannels) {
++    sChannels->erase(mId);
++  }
++}
++
++/* static */
++RefPtr<WebOSEngineChannel> WebOSEngineChannel::FromId(uint64_t aId) {
++  StaticMutexAutoLock lock(sChannelsMutex);
++  if (!sChannels) {
++    return nullptr;
++  }
++  auto it = sChannels->find(aId);
++  return it == sChannels->end() ? nullptr : RefPtr{it->second};
++}
++
++void WebOSEngineChannel::NotifyOwner(ExternalEngineEvent aEvent) {
++  if (!mOwnerGone) {
++    mOwner->NotifyEvent(aEvent);
++  }
++}
++
++RefPtr<GenericNonExclusivePromise> WebOSEngineChannel::Init(
++    const MediaInfo& aInfo) {
++  mInfo = aInfo;
++  return InvokeAsync(mTaskQueue, __func__, [self = RefPtr{this}, this] {
++    if (!Spawn()) {
++      return GenericNonExclusivePromise::CreateAndReject(NS_ERROR_FAILURE,
++                                                          __func__);
++    }
++    ConnectAdapter();
++    if (!Open()) {
++      Close();
++      return GenericNonExclusivePromise::CreateAndReject(NS_ERROR_FAILURE,
++                                                          __func__);
++    }
++    RefPtr<gfx::DataSourceSurface> surface =
++        gfx::Factory::CreateDataSourceSurface(gfx::IntSize(2, 2),
++                                              gfx::SurfaceFormat::B8G8R8A8,
++                                              /* aZero */ true);
++    if (surface) {
++      mImage = new layers::SourceSurfaceImage(surface);
++    }
++    mInited = true;
++    LOG("helper %d ready, window %s", int(mPid), mWindowId.get());
++    ScheduleTick();
++    return GenericNonExclusivePromise::CreateAndResolve(true, __func__);
++  });
++}
++
++// The helper loads the TV's own libraries, so it gets no LD_LIBRARY_PATH or
++// LD_PRELOAD from Firefox's runtime, only the variables it reads.
++bool WebOSEngineChannel::Spawn() {
++  const char* helper = getenv("GECKOTV_MEDIA_HELPER");
++  if (!helper || !helper[0]) {
++    return false;
++  }
++  int sv[2];
++  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
++    LOGW("socketpair: %s", strerror(errno));
++    return false;
++  }
++  nsTArray<nsCString> env;
++  static const char* const kPass[] = {"APPID", "HOME", "XDG_RUNTIME_DIR",
++                                      "WAYLAND_DISPLAY"};
++  for (const char* name : kPass) {
++    if (const char* v = getenv(name)) {
++      env.AppendElement(nsPrintfCString("%s=%s", name, v));
++    }
++  }
++  for (char** e = environ; e && *e; e++) {
++    if (!strncmp(*e, "GECKOTV_MEDIA_LOG=", 18)) {
++      env.AppendElement(nsCString(*e));
++    }
++  }
++  nsTArray<char*> envp;
++  for (nsCString& e : env) {
++    envp.AppendElement(e.BeginWriting());
++  }
++  envp.AppendElement(nullptr);
++  char* const argv[] = {const_cast<char*>(helper),
++                        const_cast<char*>("--media-helper"), nullptr};
++  struct rlimit nofile;
++  int maxFd = 1024;
++  if (getrlimit(RLIMIT_NOFILE, &nofile) == 0 && nofile.rlim_cur != RLIM_INFINITY) {
++    maxFd = int(std::min<rlim_t>(nofile.rlim_cur, 65536));
++  }
++
++  pid_t pid = fork();
++  if (pid < 0) {
++    LOGW("fork: %s", strerror(errno));
++    close(sv[0]);
++    close(sv[1]);
++    return false;
++  }
++  if (pid == 0) {
++    // In the child only async-signal-safe calls are allowed until execve.
++    if (sv[1] == kHelperFd) {
++      fcntl(kHelperFd, F_SETFD, 0);
++    } else if (dup2(sv[1], kHelperFd) < 0) {
++      _exit(126);
++    }
++    for (int fd = kHelperFd + 1; fd < maxFd; fd++) {
++      close(fd);
++    }
++    signal(SIGPIPE, SIG_DFL);
++    sigset_t none;
++    sigemptyset(&none);
++    sigprocmask(SIG_SETMASK, &none, nullptr);
++    execve(helper, argv, envp.Elements());
++    _exit(127);
++  }
++  close(sv[1]);
++  mFd = sv[0];
++  mPid = pid;
++  LOG("helper %s started as pid %d", helper, int(pid));
++  return true;
++}
++
++// The adapter in the parent process exports a region of the window for
++// the video plane. It tells us the exported window's id and takes the
++// video's rectangle. Without it the pipeline has no place to show the
++// picture, which is not fatal.
++void WebOSEngineChannel::ConnectAdapter() {
++  const char* path = getenv("GECKOTV_VIDEO_SOCKET");
++  struct sockaddr_un addr;
++  if (!path || !path[0] || strlen(path) >= sizeof addr.sun_path) {
++    return;
++  }
++  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++  if (fd < 0) {
++    return;
++  }
++  memset(&addr, 0, sizeof addr);
++  addr.sun_family = AF_UNIX;
++  strcpy(addr.sun_path, path);
++  if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof addr) != 0) {
++    LOGW("adapter socket %s: %s", path, strerror(errno));
++    close(fd);
++    return;
++  }
++  struct ucred cred;
++  socklen_t len = sizeof cred;
++  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 ||
++      cred.uid != getuid()) {
++    LOGW("adapter socket belongs to another user");
++    close(fd);
++    return;
++  }
++  // The window id comes right after the connection is accepted.
++  char buf[256];
++  size_t have = 0;
++  TimeStamp deadline = TimeStamp::Now() + TimeDuration::FromSeconds(2);
++  while (have < sizeof buf - 1) {
++    struct pollfd pfd = {fd, POLLIN, 0};
++    double left = (deadline - TimeStamp::Now()).ToMilliseconds();
++    if (left <= 0 || poll(&pfd, 1, int(left)) <= 0) {
++      break;
++    }
++    ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
++    if (n <= 0) {
++      break;
++    }
++    have += size_t(n);
++    buf[have] = '\0';
++    char* nl = strchr(buf, '\n');
++    if (nl) {
++      *nl = '\0';
++      if (!strncmp(buf, "windowid ", 9)) {
++        mWindowId.Assign(buf + 9);
++      }
++      break;
++    }
++  }
++  if (mWindowId.IsEmpty()) {
++    LOGW("no exported window id from the adapter");
++  }
++  mAdapterFd = fd;
++}
++
++void WebOSEngineChannel::SendAdapterRect(const gfx::IntRect& aRect) {
++  if (mAdapterFd < 0) {
++    return;
++  }
++  nsPrintfCString line("rect %d %d %d %d %d %d\n", aRect.x, aRect.y,
++                       aRect.width, aRect.height, mInfo.mVideo.mDisplay.width,
++                       mInfo.mVideo.mDisplay.height);
++  if (send(mAdapterFd, line.get(), line.Length(), MSG_NOSIGNAL | MSG_DONTWAIT) <
++      0) {
++    LOGW("adapter link lost: %s", strerror(errno));
++    close(mAdapterFd);
++    mAdapterFd = -1;
++  }
++}
++
++bool WebOSEngineChannel::Open() {
++  const VideoInfo& v = mInfo.mVideo;
++  Msg m{};
++  m.type = GM_OPEN;
++  m.arg[0] = MP4Decoder::IsH264(v.mMimeType) ? GM_VIDEO_H264 : GM_VIDEO_VP9;
++  m.arg[1] = v.mImage.width;
++  m.arg[2] = v.mImage.height;
++  // The frame rate is refined from the first samples at LOAD time, so the
++  // helper only validates it here.
++  m.arg[3] = 30;
++  m.arg[4] = 1;
++  OpenPayload p{};
++  if (mInfo.HasAudio()) {
++    const AudioInfo& a = mInfo.mAudio;
++    m.arg[5] = GM_AUDIO_AAC;
++    p.audio_rate = a.mRate;
++    p.audio_channels = a.mChannels;
++    p.audio_profile = a.mProfile ? a.mProfile : 2;
++    auto index = ADTS::GetFrequencyIndex(a.mRate);
++    if (index.isErr()) {
++      LOGW("AAC rate %u has no ADTS index", a.mRate);
++      return false;
++    }
++    p.audio_frequency_index = index.unwrap();
++  } else {
++    m.arg[5] = GM_AUDIO_NONE;
++  }
++  snprintf(p.window_id, sizeof p.window_id, "%s", mWindowId.get());
++  if (!Request(m, &p, sizeof p, kOpenTimeoutMs)) {
++    LOGW("helper did not answer OPEN");
++    return false;
++  }
++  if (m.arg[0] != GM_OK) {
++    LOGW("helper refused the stream (%d)", m.arg[0]);
++    return false;
++  }
++  return true;
++}
++
++bool WebOSEngineChannel::SendAll(const void* aData, size_t aLen,
++                                 const TimeStamp& aDeadline) {
++  const uint8_t* p = static_cast<const uint8_t*>(aData);
++  while (aLen) {
++    struct pollfd pfd = {mFd, POLLOUT, 0};
++    double left = (aDeadline - TimeStamp::Now()).ToMilliseconds();
++    if (left <= 0 || poll(&pfd, 1, int(left)) <= 0) {
++      return false;
++    }
++    ssize_t n = send(mFd, p, aLen, MSG_NOSIGNAL | MSG_DONTWAIT);
++    if (n < 0) {
++      if (errno == EINTR || errno == EAGAIN) {
++        continue;
++      }
++      return false;
++    }
++    p += n;
++    aLen -= size_t(n);
++  }
++  return true;
++}
++
++bool WebOSEngineChannel::RecvAll(void* aData, size_t aLen,
++                                 const TimeStamp& aDeadline) {
++  uint8_t* p = static_cast<uint8_t*>(aData);
++  while (aLen) {
++    struct pollfd pfd = {mFd, POLLIN, 0};
++    double left = (aDeadline - TimeStamp::Now()).ToMilliseconds();
++    if (left <= 0 || poll(&pfd, 1, int(left)) <= 0) {
++      return false;
++    }
++    ssize_t n = recv(mFd, p, aLen, MSG_DONTWAIT);
++    if (n == 0) {
++      return false;
++    }
++    if (n < 0) {
++      if (errno == EINTR || errno == EAGAIN) {
++        continue;
++      }
++      return false;
++    }
++    p += n;
++    aLen -= size_t(n);
++  }
++  return true;
++}
++
++// Sends one request and waits for the reply that replaces aMsg. A
++// missing or malformed reply within the timeout is a dead helper.
++bool WebOSEngineChannel::Request(Msg& aMsg, const void* aPayload, size_t aSize,
++                                 int aTimeoutMs) {
++  if (mFd < 0 || aSize > kMaxPayload) {
++    return false;
++  }
++  aMsg.magic = kMagic;
++  aMsg.size = uint32_t(aSize);
++  mRequestsThisTick++;
++  TimeStamp deadline =
++      TimeStamp::Now() + TimeDuration::FromMilliseconds(aTimeoutMs);
++  if (!SendAll(&aMsg, sizeof aMsg, deadline) ||
++      (aSize && !SendAll(aPayload, aSize, deadline))) {
++    return false;
++  }
++  Msg reply;
++  if (!RecvAll(&reply, sizeof reply, deadline)) {
++    return false;
++  }
++  if (reply.magic != kMagic || reply.type != GM_REPLY || reply.size != 0) {
++    LOGW("malformed reply");
++    return false;
++  }
++  aMsg = reply;
++  return true;
++}
++
++void WebOSEngineChannel::ScheduleTick() {
++  if (mClosed) {
++    return;
++  }
++  mTimer->WaitFor(TimeDuration::FromMilliseconds(kTickMs), __func__)
++      ->Then(
++          mTaskQueue, __func__,
++          [self = RefPtr{this}, this](bool) {
++            mTickRequest.Complete();
++            Tick();
++          },
++          [self = RefPtr{this}, this](bool) { mTickRequest.Complete(); })
++      ->Track(mTickRequest);
++}
++
++int64_t WebOSEngineChannel::LeadUs() const {
++  return int64_t(mHasFrameSinceLoad ? StaticPrefs::media_webos_engine_lead_ms()
++                                    : StaticPrefs::media_webos_engine_preroll_ms()) *
++         1000;
++}
++
++// Loads the pipeline once the first video sample is here and hands over
++// the samples whose time has come. Runs when a sample arrives and on
++// every tick, so the pipeline's clock sets the pace rather than the tick.
++bool WebOSEngineChannel::Pump() {
++  if (!mPipelineRequested && mVideo.mSample && !SendLoad()) {
++    return false;
++  }
++  if (!mPipelineRequested) {
++    return true;
++  }
++  return FeedOne(mVideo, TrackInfo::kVideoTrack) &&
++         FeedOne(mAudio, TrackInfo::kAudioTrack) &&
++         SendEos(mVideo, TrackInfo::kVideoTrack) &&
++         SendEos(mAudio, TrackInfo::kAudioTrack);
++}
++
++// Every 25 ms releases the samples held back for the lead and reads the
++// pipeline's state from a reply.
++void WebOSEngineChannel::Tick() {
++  if (mClosed || mFatal) {
++    return;
++  }
++  mRequestsThisTick = 0;
++  if (!Pump()) {
++    return;
++  }
++  if (mRequestsThisTick == 0) {
++    Msg m{};
++    m.type = GM_STATUS;
++    if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++      Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                       RESULT_DETAIL("webOS helper stopped answering")));
++      return;
++    }
++    HandleReply(m);
++  }
++  if (mRectSent == false && !mRect.IsEmpty()) {
++    SendAdapterRect(mRect);
++    mRectSent = true;
++  }
++  ScheduleTick();
++}
++
++bool WebOSEngineChannel::SendLoad() {
++  const MediaRawData& s = *mVideo.mSample;
++  Msg m{};
++  m.type = GM_LOAD;
++  m.time_us = mLoadTimeUs;
++  // The open declared 30 fps but the real rate is in the sample durations.
++  // The pipeline judders when told a rate above the stream's.
++  m.arg[0] = 30000;
++  m.arg[1] = 1000;
++  if (s.mDuration.IsValid() && s.mDuration.ToMicroseconds() > 0) {
++    int32_t fps = int32_t(std::lround(1e9 / double(s.mDuration.ToMicroseconds())));
++    if (fps >= 1000 && fps <= 120000) {
++      m.arg[0] = fps;
++    }
++  }
++  LOG("LOAD at %" PRId64 " us, %d/1000 fps", mLoadTimeUs, m.arg[0]);
++  if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++    Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                     RESULT_DETAIL("webOS helper stopped answering LOAD")));
++    return false;
++  }
++  mPipelineRequested = true;
++  mHasFrameSinceLoad = false;
++  mVideo.mEosSent = mAudio.mEosSent = false;
++  HandleReply(m);
++  return !mFatal;
++}
++
++// One sample at most waits per track and goes out once its time is within
++// the lead of the pipeline's clock. BufferFull keeps it for the next tick.
++bool WebOSEngineChannel::FeedOne(Track& aTrack, TrackInfo::TrackType aType) {
++  if (!aTrack.mSample) {
++    return true;
++  }
++  const MediaRawData& s = *aTrack.mSample;
++  int64_t pts = s.mTime.ToMicroseconds();
++  if (pts > mPositionUs + LeadUs()) {
++    return true;
++  }
++  Msg m{};
++  m.type = GM_FEED;
++  m.arg[0] = aType == TrackInfo::kVideoTrack ? GM_TRACK_VIDEO : GM_TRACK_AUDIO;
++  m.arg[1] = s.mKeyframe;
++  m.time_us = pts;
++  if (!Request(m, s.Data(), s.Size(), kReplyTimeoutMs)) {
++    Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                     RESULT_DETAIL("webOS helper stopped answering FEED")));
++    return false;
++  }
++  int result = m.arg[0];
++  LOGV("fed %s pts=%" PRId64 " result=%d",
++       aType == TrackInfo::kVideoTrack ? "video" : "audio", pts, result);
++  HandleReply(m);
++  if (mFatal) {
++    return false;
++  }
++  if (result == GM_RETRY) {
++    return true;
++  }
++  if (result != GM_OK) {
++    Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                     RESULT_DETAIL("webOS pipeline refused a sample")));
++    return false;
++  }
++  aTrack.mLastFedUs = pts;
++  RefPtr<MediaData> out = FakeOutput(aType, s);
++  aTrack.mSample = nullptr;
++  MediaDataDecoder::DecodedData outputs;
++  if (out) {
++    outputs.AppendElement(out);
++  }
++  aTrack.mPromise.ResolveIfExists(std::move(outputs), __func__);
++  return true;
++}
++
++bool WebOSEngineChannel::SendEos(Track& aTrack, TrackInfo::TrackType aType) {
++  if (!aTrack.mEnded || aTrack.mEosSent || aTrack.mSample) {
++    return true;
++  }
++  Msg m{};
++  m.type = GM_EOS;
++  m.arg[0] = aType == TrackInfo::kVideoTrack ? GM_TRACK_VIDEO : GM_TRACK_AUDIO;
++  if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++    Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                     RESULT_DETAIL("webOS helper stopped answering EOS")));
++    return false;
++  }
++  aTrack.mEosSent = true;
++  HandleReply(m);
++  return !mFatal;
++}
++
++already_AddRefed<MediaData> WebOSEngineChannel::FakeOutput(
++    TrackInfo::TrackType aType, const MediaRawData& aSample) {
++  if (aType == TrackInfo::kVideoTrack) {
++    if (!mImage) {
++      return nullptr;
++    }
++    RefPtr<VideoData> v = VideoData::CreateFromImage(
++        mInfo.mVideo.mDisplay, aSample.mOffset, aSample.mTime,
++        aSample.mDuration, mImage, aSample.mKeyframe, aSample.mTimecode);
++    return v.forget();
++  }
++  RefPtr<MediaData> a =
++      new AudioData(aSample.mOffset, aSample.mTime, AlignedAudioBuffer{},
++                    mInfo.mAudio.mChannels, mInfo.mAudio.mRate);
++  return a.forget();
++}
++
++// The pipeline's state travels in every reply.
++void WebOSEngineChannel::HandleReply(const Msg& aReply) {
++  int flags = aReply.arg[1];
++  int before = mLastFlags;
++  mLastFlags = flags;
++  if (flags & GM_F_FAILED) {
++    LOGW("pipeline failed (error %d), loaded before: %d", aReply.arg[2],
++         mEverLoaded);
++    // Before the first load the TV may just have no decoder for us, and
++    // Firefox then plays in software. Afterwards the stream is lost.
++    Fail(MediaResult(mEverLoaded ? NS_ERROR_DOM_MEDIA_DECODE_ERR
++                                 : NS_ERROR_DOM_MEDIA_NOT_SUPPORTED_ERR,
++                     RESULT_DETAIL("webOS pipeline error %d", aReply.arg[2])));
++    return;
++  }
++  if (!(flags & GM_F_PIPELINE) && (before & GM_F_PIPELINE)) {
++    // The helper unloaded after a refused seek, so load again at the position.
++    LOG("pipeline gone, reloading at %" PRId64, int64_t(mPositionUs));
++    mPipelineRequested = false;
++    mLoadTimeUs = mPositionUs;
++    mHasFrameSinceLoad = false;
++  }
++  if ((flags & GM_F_LOADED) && !(before & GM_F_LOADED)) {
++    mEverLoaded = true;
++    if (!mLoadedReported) {
++      mLoadedReported = true;
++      NotifyOwner(ExternalEngineEvent::LoadedData);
++    }
++  }
++  if (flags & GM_F_HAS_FRAME) {
++    mHasFrameSinceLoad = true;
++    int64_t t = aReply.time_us;
++    if (mVideo.mLastFedUs >= 0 && t > mVideo.mLastFedUs) {
++      t = mVideo.mLastFedUs;
++    }
++    if (t != mPositionUs) {
++      mPositionUs = t;
++    }
++  }
++  if (mPositionUs != mLastTimeupdateUs &&
++      (mLastTimeupdateUs < 0 ||
++       std::abs(mPositionUs - mLastTimeupdateUs) >= kTimeupdateIntervalUs)) {
++    mLastTimeupdateUs = mPositionUs;
++    NotifyOwner(ExternalEngineEvent::Timeupdate);
++  }
++  if ((flags & GM_F_ENDED) && !mEndedReported) {
++    mEndedReported = true;
++    NotifyOwner(ExternalEngineEvent::Ended);
++  }
++}
++
++void WebOSEngineChannel::Fail(const MediaResult& aError) {
++  if (mFatal) {
++    return;
++  }
++  mFatal = true;
++  LOGW("%s", aError.Description().get());
++  RejectPending(mVideo);
++  RejectPending(mAudio);
++  if (!mOwnerGone) {
++    mOwner->NotifyError(aError);
++  }
++}
++
++void WebOSEngineChannel::RejectPending(Track& aTrack) {
++  aTrack.mSample = nullptr;
++  aTrack.mPromise.RejectIfExists(NS_ERROR_DOM_MEDIA_CANCELED, __func__);
++}
++
++void WebOSEngineChannel::Shutdown() {
++  mOwnerGone = true;
++  mInited = false;
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::Shutdown", [self = RefPtr{this}, this] {
++        Close();
++        mTaskQueue->BeginShutdown();
++      }));
++}
++
++// Tells the helper to unload, then makes sure it is gone. A helper stuck
++// inside LG's library is killed by a thread that never blocks this queue.
++void WebOSEngineChannel::Close() {
++  if (mClosed) {
++    return;
++  }
++  mClosed = true;
++  mTickRequest.DisconnectIfExists();
++  mTimer->Cancel();
++  RejectPending(mVideo);
++  RejectPending(mAudio);
++  if (mFd >= 0) {
++    Msg m{};
++    m.type = GM_CLOSE;
++    Request(m, nullptr, 0, 500);
++    close(mFd);
++    mFd = -1;
++  }
++  if (mAdapterFd >= 0) {
++    close(mAdapterFd);
++    mAdapterFd = -1;
++  }
++  if (mPid > 0) {
++    pid_t pid = mPid;
++    mPid = 0;
++    std::thread([pid] {
++      for (int i = 0; i < 40; i++) {
++        int status;
++        if (waitpid(pid, &status, WNOHANG) != 0) {
++          return;
++        }
++        usleep(50 * 1000);
++      }
++      kill(pid, SIGKILL);
++      int status;
++      waitpid(pid, &status, 0);
++    }).detach();
++  }
++}
++
++void WebOSEngineChannel::Play() {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::Play", [self = RefPtr{this}, this] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        mPlaying = true;
++        Msg m{};
++        m.type = GM_PLAY;
++        if (Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          HandleReply(m);
++        }
++      }));
++}
++
++void WebOSEngineChannel::Pause() {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::Pause", [self = RefPtr{this}, this] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        mPlaying = false;
++        Msg m{};
++        m.type = GM_PAUSE;
++        if (Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          HandleReply(m);
++        }
++      }));
++}
++
++// The clock jumps to the target at once. The state machine resets the
++// reader and the reader's flush drops the samples that wait here. Samples
++// from the target follow. The helper flushes its pipeline and starts a new
++// segment at the first sample it gets.
++void WebOSEngineChannel::Seek(const media::TimeUnit& aTarget) {
++  int64_t target = aTarget.ToMicroseconds();
++  mPositionUs = target;
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::Seek", [self = RefPtr{this}, this, target] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        mPositionUs = target;
++        mLoadTimeUs = target;
++        mHasFrameSinceLoad = false;
++        mEndedReported = false;
++        mVideo.mEnded = mAudio.mEnded = false;
++        mVideo.mEosSent = mAudio.mEosSent = false;
++        mVideo.mLastFedUs = mAudio.mLastFedUs = -1;
++        // The samples that wait here are from before the target, and their
++        // promises stay pending until the reader flushes the decoders. A
++        // rejection sent now can reach the reader before its flush, and it
++        // then keeps the cancel as a fatal error that silently stops the seek.
++        mVideo.mSample = nullptr;
++        mAudio.mSample = nullptr;
++        Msg m{};
++        m.type = GM_SEEK;
++        m.time_us = target;
++        if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                           RESULT_DETAIL("webOS helper stopped answering SEEK")));
++          return;
++        }
++        HandleReply(m);
++        NotifyOwner(ExternalEngineEvent::Seeked);
++      }));
++}
++
++// The pipeline plays at one speed when fed this way. Another rate is
++// refused, so Firefox continues in software at the position.
++void WebOSEngineChannel::SetPlaybackRate(double aRate) {
++  if (aRate == 1.0 || aRate == 0.0) {
++    return;
++  }
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::SetPlaybackRate", [self = RefPtr{this}, this] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        Fail(MediaResult(NS_ERROR_DOM_MEDIA_NOT_SUPPORTED_ERR,
++                         RESULT_DETAIL("playback rate on the webOS pipeline")));
++      }));
++}
++
++void WebOSEngineChannel::SetVolume(double aVolume) {
++  int volume = int(std::lround(std::clamp(aVolume, 0.0, 1.0) * 100));
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::SetVolume", [self = RefPtr{this}, this, volume] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        Msg m{};
++        m.type = GM_VOLUME;
++        m.arg[0] = volume;
++        if (Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          HandleReply(m);
++        }
++      }));
++}
++
++void WebOSEngineChannel::NotifyEndOfStream(TrackInfo::TrackType aType) {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::NotifyEndOfStream",
++      [self = RefPtr{this}, this, aType] {
++        if (mClosed) {
++          return;
++        }
++        TrackFor(aType).mEnded = true;
++      }));
++}
++
++static bool SameBytes(const RefPtr<MediaByteBuffer>& aA,
++                      const RefPtr<MediaByteBuffer>& aB) {
++  size_t a = aA ? aA->Length() : 0;
++  size_t b = aB ? aB->Length() : 0;
++  return a == b && (a == 0 || memcmp(aA->Elements(), aB->Elements(), a) == 0);
++}
++
++// Firefox creates a new video decoder when the stream's parameter sets
++// change. An adaptive player does that when it switches level at a seek or
++// on a bandwidth change. The TV's decoder does not survive a new SPS
++// mid-stream, so the pipeline is dropped here and the next video sample
++// loads it again at the position.
++void WebOSEngineChannel::NotifyVideoConfig(const VideoInfo& aInfo) {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::NotifyVideoConfig",
++      [self = RefPtr{this}, this, info = aInfo] {
++        if (mClosed || mFatal) {
++          return;
++        }
++        const VideoInfo& cur = mInfo.mVideo;
++        if (cur.mImage == info.mImage && cur.mDisplay == info.mDisplay &&
++            SameBytes(cur.mExtraData, info.mExtraData)) {
++          return;
++        }
++        LOG("video config %dx%d (%u bytes) -> %dx%d (%u bytes)%s",
++            cur.mImage.width, cur.mImage.height,
++            unsigned(cur.mExtraData ? cur.mExtraData->Length() : 0),
++            info.mImage.width, info.mImage.height,
++            unsigned(info.mExtraData ? info.mExtraData->Length() : 0),
++            mPipelineRequested ? ", reloading the pipeline" : "");
++        mInfo.mVideo = info;
++        if (!mPipelineRequested) {
++          return;
++        }
++        Msg m{};
++        m.type = GM_UNLOAD;
++        if (!Request(m, nullptr, 0, kReplyTimeoutMs)) {
++          Fail(MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                           RESULT_DETAIL("webOS helper stopped answering UNLOAD")));
++          return;
++        }
++        mVideo.mLastFedUs = mAudio.mLastFedUs = -1;
++        HandleReply(m);
++      }));
++}
++
++void WebOSEngineChannel::SetVideoRect(const gfx::IntRect& aRect) {
++  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
++      "WebOSEngineChannel::SetVideoRect", [self = RefPtr{this}, this, aRect] {
++        if (mClosed || aRect == mRect) {
++          return;
++        }
++        mRect = aRect;
++        mRectSent = false;
++        SendAdapterRect(aRect);
++        mRectSent = true;
++      }));
++}
++
++RefPtr<WebOSEngineChannel::DecodePromise> WebOSEngineChannel::Submit(
++    TrackInfo::TrackType aType, RefPtr<MediaRawData> aSample) {
++  return InvokeAsync(
++      mTaskQueue, __func__,
++      [self = RefPtr{this}, this, aType, sample = std::move(aSample)]() mutable
++          -> RefPtr<DecodePromise> {
++        if (mClosed || mFatal) {
++          return DecodePromise::CreateAndReject(
++              MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                          RESULT_DETAIL("webOS engine is gone")),
++              __func__);
++        }
++        Track& track = TrackFor(aType);
++        if (track.mSample) {
++          // The reader keeps one decode in flight per track.
++          return DecodePromise::CreateAndReject(
++              MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                          RESULT_DETAIL("sample submitted while one waits")),
++              __func__);
++        }
++        LOGV("submit %s pts=%" PRId64 " key=%d",
++             aType == TrackInfo::kVideoTrack ? "video" : "audio",
++             sample->mTime.ToMicroseconds(), int(sample->mKeyframe));
++        track.mSample = std::move(sample);
++        RefPtr<DecodePromise> p = track.mPromise.Ensure(__func__);
++        Pump();
++        return p;
++      });
++}
++
++RefPtr<GenericPromise> WebOSEngineChannel::Flush(TrackInfo::TrackType aType) {
++  return InvokeAsync(mTaskQueue, __func__, [self = RefPtr{this}, this, aType] {
++    RejectPending(TrackFor(aType));
++    return GenericPromise::CreateAndResolve(true, __func__);
++  });
++}
++
++#undef LOG
++#undef LOGW
++#undef LOGV
++
++}  // namespace mozilla
+diff --git a/dom/media/platforms/webos/WebOSEngine.h b/dom/media/platforms/webos/WebOSEngine.h
+new file mode 100644
+index 0000000000..dbbd1541dc
+--- /dev/null
++++ b/dom/media/platforms/webos/WebOSEngine.h
+@@ -0,0 +1,185 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
++#define DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
++
++#include "ExternalEngineStateMachine.h"
++#include "MediaData.h"
++#include "MediaInfo.h"
++#include "MediaMIMETypes.h"
++#include "MediaTimer.h"
++#include "PlatformDecoderModule.h"
++#include "mozilla/Atomics.h"
++#include "mozilla/MozPromise.h"
++#include "mozilla/TaskQueue.h"
++#include "mozilla/gfx/Rect.h"
++
++namespace mozilla {
++
++/**
++ * One playback through LG webOS's Starfish media pipeline. A helper process
++ * (geckotv --media-helper) drives the pipeline. This class starts the helper,
++ * talks to it over a socketpair and stops it. The ExternalEngineStateMachine
++ * owns a WebOSEngine. The pass-through decoders of WebOSEngineDecoderModule
++ * hand their compressed samples to the channel named by the engine's id.
++ * Everything but the thread-safe getters runs on the channel's task queue,
++ * and the socket is only used there.
++ */
++class WebOSEngineChannel final {
++ public:
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WebOSEngineChannel)
++
++  using DecodePromise = MediaDataDecoder::DecodePromise;
++
++  explicit WebOSEngineChannel(ExternalEngineStateMachine* aOwner);
++
++  static RefPtr<WebOSEngineChannel> FromId(uint64_t aId);
++
++  uint64_t Id() const { return mId; }
++  TaskQueue* Queue() const { return mTaskQueue; }
++
++  // ExternalPlaybackEngine operations, forwarded by WebOSEngine.
++  RefPtr<GenericNonExclusivePromise> Init(const MediaInfo& aInfo);
++  void Shutdown();
++  bool IsInited() const { return mInited; }
++  void Play();
++  void Pause();
++  void Seek(const media::TimeUnit& aTarget);
++  void SetPlaybackRate(double aRate);
++  void SetVolume(double aVolume);
++  void NotifyEndOfStream(TrackInfo::TrackType aType);
++  void SetVideoRect(const gfx::IntRect& aRect);
++  void NotifyVideoConfig(const VideoInfo& aInfo);
++  media::TimeUnit GetCurrentPosition() const {
++    return media::TimeUnit::FromMicroseconds(mPositionUs);
++  }
++
++  // Decoder side. Submit resolves once the sample is handed to the
++  // pipeline, and Flush rejects what is pending.
++  RefPtr<DecodePromise> Submit(TrackInfo::TrackType aType,
++                               RefPtr<MediaRawData> aSample);
++  RefPtr<GenericPromise> Flush(TrackInfo::TrackType aType);
++
++  const MediaInfo& Info() const { return mInfo; }
++
++ private:
++  ~WebOSEngineChannel();
++
++  struct Msg;
++  struct Track {
++    RefPtr<MediaRawData> mSample;
++    MozPromiseHolder<DecodePromise> mPromise;
++    bool mEnded = false;
++    bool mEosSent = false;
++    int64_t mLastFedUs = -1;
++  };
++
++  bool Spawn();
++  bool Open();
++  void ConnectAdapter();
++  void SendAdapterRect(const gfx::IntRect& aRect);
++  bool Request(Msg& aMsg, const void* aPayload, size_t aSize, int aTimeoutMs);
++  bool SendAll(const void* aData, size_t aLen, const TimeStamp& aDeadline);
++  bool RecvAll(void* aData, size_t aLen, const TimeStamp& aDeadline);
++  bool Pump();
++  void Tick();
++  void ScheduleTick();
++  bool FeedOne(Track& aTrack, TrackInfo::TrackType aType);
++  bool SendLoad();
++  bool SendEos(Track& aTrack, TrackInfo::TrackType aType);
++  void HandleReply(const Msg& aReply);
++  void Fail(const MediaResult& aError);
++  void Close();
++  void RejectPending(Track& aTrack);
++  already_AddRefed<MediaData> FakeOutput(TrackInfo::TrackType aType,
++                                         const MediaRawData& aSample);
++  Track& TrackFor(TrackInfo::TrackType aType) {
++    return aType == TrackInfo::kVideoTrack ? mVideo : mAudio;
++  }
++  void NotifyOwner(ExternalEngineEvent aEvent);
++  int64_t LeadUs() const;
++
++  const uint64_t mId;
++  ExternalEngineStateMachine* MOZ_NON_OWNING_REF mOwner;
++  RefPtr<TaskQueue> mTaskQueue;
++  RefPtr<MediaTimer<TimeStamp>> mTimer;
++  MozPromiseRequestHolder<MediaTimerPromise> mTickRequest;
++
++  MediaInfo mInfo;
++  Atomic<bool> mInited{false};
++  Atomic<bool> mOwnerGone{false};
++  Atomic<int64_t> mPositionUs{0};
++
++  int mFd = -1;
++  pid_t mPid = 0;
++  int mAdapterFd = -1;
++  nsCString mWindowId;
++
++  Track mVideo;
++  Track mAudio;
++  bool mPlaying = false;
++  bool mClosed = false;
++  bool mFatal = false;
++  bool mPipelineRequested = false;
++  bool mEverLoaded = false;
++  bool mLoadedReported = false;
++  bool mEndedReported = false;
++  bool mHasFrameSinceLoad = false;
++  int mLastFlags = 0;
++  int mRequestsThisTick = 0;
++  int64_t mLoadTimeUs = 0;
++  int64_t mLastTimeupdateUs = -1;
++  gfx::IntRect mRect;
++  bool mRectSent = false;
++  RefPtr<layers::Image> mImage;
++};
++
++class WebOSEngine final : public ExternalPlaybackEngine {
++ public:
++  explicit WebOSEngine(ExternalEngineStateMachine* aOwner);
++  ~WebOSEngine();
++
++  // True when the launcher set up a helper for this run.
++  static bool IsAvailable();
++  // Unencrypted H.264 or VP9 video with no audio or AAC audio.
++  static bool SupportsFormat(const MediaInfo& aInfo);
++  // The same codecs, for a Media Source type's codecs list.
++  static bool SupportsCodecs(const MediaCodecs& aCodecs);
++
++  RefPtr<GenericNonExclusivePromise> Init(const MediaInfo& aInfo,
++                                          const InitFlagSet& aFlags) override;
++  void Shutdown() override;
++  uint64_t Id() const override { return mChannel->Id(); }
++  bool IsInited() const override { return mChannel->IsInited(); }
++  void Play() override { mChannel->Play(); }
++  void Pause() override { mChannel->Pause(); }
++  void Seek(const media::TimeUnit& aTargetTime) override {
++    mChannel->Seek(aTargetTime);
++  }
++  void SetPlaybackRate(double aPlaybackRate) override {
++    mChannel->SetPlaybackRate(aPlaybackRate);
++  }
++  void SetVolume(double aVolume) override { mChannel->SetVolume(aVolume); }
++  void SetLooping(bool aLooping) override {}
++  void SetPreservesPitch(bool aPreservesPitch) override {}
++  media::TimeUnit GetCurrentPosition() override {
++    return mChannel->GetCurrentPosition();
++  }
++  void NotifyEndOfStream(TrackInfo::TrackType aType) override {
++    mChannel->NotifyEndOfStream(aType);
++  }
++  bool SetCDMProxy(CDMProxy* aProxy) override { return false; }
++  void NotifyResizing(uint32_t aWidth, uint32_t aHeight) override {}
++  void SetVideoRect(const gfx::IntRect& aRect) override {
++    mChannel->SetVideoRect(aRect);
++  }
++
++ private:
++  RefPtr<WebOSEngineChannel> mChannel;
++};
++
++}  // namespace mozilla
++
++#endif  // DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
+diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
+new file mode 100644
+index 0000000000..44fba424a2
+--- /dev/null
++++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
+@@ -0,0 +1,167 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "WebOSEngineDecoderModule.h"
++
++#include "Adts.h"
++#include "MP4Decoder.h"
++#include "VPXDecoder.h"
++#include "WebOSEngine.h"
++#include "mozilla/Logging.h"
++
++namespace mozilla {
++
++extern LazyLogModule sPDMLog;
++
++namespace {
++
++class WebOSEngineStream final : public MediaDataDecoder {
++ public:
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WebOSEngineStream, final);
++
++  WebOSEngineStream(WebOSEngineChannel* aChannel, const TrackInfo& aInfo)
++      : mChannel(aChannel), mInfo(aInfo.Clone()) {}
++
++  RefPtr<InitPromise> Init() override {
++    return InitPromise::CreateAndResolve(mInfo->GetType(), __func__);
++  }
++
++  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override {
++    RefPtr<MediaRawData> sample = aSample;
++    if (mInfo->GetType() == TrackInfo::kAudioTrack) {
++      // The pipeline takes AAC as ADTS frames.
++      const AudioInfo* audio = mInfo->GetAsAudioInfo();
++      if (!ADTS::FrameHeader::MatchesSync(Span{sample->Data(), sample->Size()})) {
++        sample = aSample->Clone();
++        auto index = ADTS::GetFrequencyIndex(audio->mRate);
++        if (!sample || index.isErr() ||
++            !ADTS::ConvertSample(audio->mChannels, index.unwrap(),
++                                 audio->mProfile ? audio->mProfile : 2,
++                                 sample)) {
++          return DecodePromise::CreateAndReject(
++              MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR,
++                          RESULT_DETAIL("ADTS conversion failed")),
++              __func__);
++        }
++      }
++    }
++    return mChannel->Submit(mInfo->GetType(), std::move(sample));
++  }
++
++  // At most one sample waits in the channel, and the reader never drains
++  // while one is in flight, so there is nothing to return here.
++  RefPtr<DecodePromise> Drain() override {
++    return DecodePromise::CreateAndResolve(DecodedData(), __func__);
++  }
++
++  RefPtr<FlushPromise> Flush() override {
++    return mChannel->Flush(mInfo->GetType())
++        ->Then(
++            mChannel->Queue(), __func__,
++            [](bool) { return FlushPromise::CreateAndResolve(true, __func__); },
++            [](nsresult) {
++              return FlushPromise::CreateAndResolve(true, __func__);
++            });
++  }
++
++  RefPtr<ShutdownPromise> Shutdown() override {
++    return ShutdownPromise::CreateAndResolve(true, __func__);
++  }
++
++  bool IsHardwareAccelerated(nsACString& aFailureReason) const override {
++    return mInfo->GetType() == TrackInfo::kVideoTrack;
++  }
++
++  nsCString GetDescriptionName() const override {
++    return mInfo->GetType() == TrackInfo::kVideoTrack
++               ? "webos media engine video"_ns
++               : "webos media engine audio"_ns;
++  }
++
++  nsCString GetCodecName() const override {
++    if (MP4Decoder::IsH264(mInfo->mMimeType)) {
++      return "h264"_ns;
++    }
++    if (VPXDecoder::IsVP9(mInfo->mMimeType)) {
++      return "vp9"_ns;
++    }
++    return "aac"_ns;
++  }
++
++  ConversionRequired NeedsConversion() const override {
++    return MP4Decoder::IsH264(mInfo->mMimeType)
++               ? ConversionRequired::kNeedAnnexB
++               : ConversionRequired::kNeedNone;
++  }
++
++  bool ShouldDecoderAlwaysBeRecycled() const override { return true; }
++
++ private:
++  ~WebOSEngineStream() = default;
++
++  RefPtr<WebOSEngineChannel> mChannel;
++  UniquePtr<TrackInfo> mInfo;
++};
++
++bool CodecSupported(const nsACString& aMimeType) {
++  return MP4Decoder::IsH264(aMimeType) || VPXDecoder::IsVP9(aMimeType) ||
++         MP4Decoder::IsAAC(aMimeType);
++}
++
++already_AddRefed<MediaDataDecoder> CreateStream(
++    const CreateDecoderParams& aParams) {
++  if (!aParams.mMediaEngineId || !CodecSupported(aParams.mConfig.mMimeType)) {
++    return nullptr;
++  }
++  RefPtr<WebOSEngineChannel> channel =
++      WebOSEngineChannel::FromId(*aParams.mMediaEngineId);
++  if (!channel) {
++    MOZ_LOG(sPDMLog, LogLevel::Warning,
++            ("WebOSEngineDecoderModule: no engine %" PRIu64,
++             *aParams.mMediaEngineId));
++    return nullptr;
++  }
++  if (aParams.mConfig.IsVideo()) {
++    channel->NotifyVideoConfig(*aParams.mConfig.GetAsVideoInfo());
++  }
++  RefPtr<MediaDataDecoder> decoder =
++      new WebOSEngineStream(channel, aParams.mConfig);
++  return decoder.forget();
++}
++
++}  // namespace
++
++/* static */
++already_AddRefed<PlatformDecoderModule> WebOSEngineDecoderModule::Create() {
++  RefPtr<WebOSEngineDecoderModule> module = new WebOSEngineDecoderModule();
++  return module.forget();
++}
++
++already_AddRefed<MediaDataDecoder> WebOSEngineDecoderModule::CreateVideoDecoder(
++    const CreateDecoderParams& aParams) {
++  return CreateStream(aParams);
++}
++
++already_AddRefed<MediaDataDecoder> WebOSEngineDecoderModule::CreateAudioDecoder(
++    const CreateDecoderParams& aParams) {
++  return CreateStream(aParams);
++}
++
++media::DecodeSupportSet WebOSEngineDecoderModule::SupportsMimeType(
++    const nsACString& aMimeType, DecoderDoctorDiagnostics* aDiagnostics) const {
++  // Only reachable through Supports() with an engine id.
++  return media::DecodeSupportSet{};
++}
++
++media::DecodeSupportSet WebOSEngineDecoderModule::Supports(
++    const SupportDecoderParams& aParams,
++    DecoderDoctorDiagnostics* aDiagnostics) const {
++  if (!aParams.mMediaEngineId || !CodecSupported(aParams.MimeType())) {
++    return media::DecodeSupportSet{};
++  }
++  return aParams.mConfig.IsVideo() ? media::DecodeSupport::HardwareDecode
++                                   : media::DecodeSupport::SoftwareDecode;
++}
++
++}  // namespace mozilla
+diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.h b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
+new file mode 100644
+index 0000000000..c0591f0aa4
+--- /dev/null
++++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
+@@ -0,0 +1,44 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINEDECODERMODULE_H_
++#define DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINEDECODERMODULE_H_
++
++#include "PlatformDecoderModule.h"
++
++namespace mozilla {
++
++/**
++ * Content-process decoders for playback on the webOS media engine. They
++ * hand compressed samples to the WebOSEngineChannel named by the decoder
++ * params' media engine id and return placeholder output because the TV's
++ * pipeline decodes and shows the frames itself. Without an engine id the
++ * module declines, so ordinary playback never comes here.
++ */
++class WebOSEngineDecoderModule final : public PlatformDecoderModule {
++ public:
++  static already_AddRefed<PlatformDecoderModule> Create();
++
++  already_AddRefed<MediaDataDecoder> CreateVideoDecoder(
++      const CreateDecoderParams& aParams) override;
++  already_AddRefed<MediaDataDecoder> CreateAudioDecoder(
++      const CreateDecoderParams& aParams) override;
++
++  media::DecodeSupportSet SupportsMimeType(
++      const nsACString& aMimeType,
++      DecoderDoctorDiagnostics* aDiagnostics) const override;
++  media::DecodeSupportSet Supports(
++      const SupportDecoderParams& aParams,
++      DecoderDoctorDiagnostics* aDiagnostics) const override;
++
++  const char* Name() const override { return "WebOSEngine"; }
++
++ private:
++  WebOSEngineDecoderModule() = default;
++  ~WebOSEngineDecoderModule() = default;
++};
++
++}  // namespace mozilla
++
++#endif  // DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINEDECODERMODULE_H_
+diff --git a/dom/media/platforms/wrappers/MediaChangeMonitor.cpp b/dom/media/platforms/wrappers/MediaChangeMonitor.cpp
+index 36c4259498..196badf908 100644
+--- a/dom/media/platforms/wrappers/MediaChangeMonitor.cpp
++++ b/dom/media/platforms/wrappers/MediaChangeMonitor.cpp
+@@ -74,7 +74,7 @@ class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+       : mCurrentConfig(aParams.VideoConfig()),
+         mFullParsing(aParams.mOptions.contains(
+             CreateDecoderParams::Option::FullH264Parsing))
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+         ,
+         mIsMediaEnginePlayback(aParams.mMediaEngineId.isSome())
+ #endif
+@@ -141,7 +141,7 @@ class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+       extra_data = aSample->mExtraData;
+     } else {
+       // A situation where inband SPS exists in the sample.
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+       extra_data = MergeParameterSetsWhenInbandSPSExists(extra_data);
+ #endif
+       if (H264::CompareExtraData(extra_data, mCurrentConfig.mExtraData)) {
+@@ -178,7 +178,7 @@ class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+     aSample->mTrackInfo = mTrackInfo;
+ 
+     bool appendExtradata = aNeedKeyFrame;
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+     // The error SPR_E_INVALID_H264_SLICE_HEADERS is caused by the media engine
+     // being unable to handle an IDR frame without a valid SPS. Therefore, we
+     // ensure that SPS should always be presented in the bytestream for all IDR
+@@ -234,7 +234,7 @@ class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+     mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+   }
+ 
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   // Merge aExtraData, containing in-band parameter set updates having at least
+   // one SPS, with mCurrentConfig.mExtraData, and return the merged
+   // AVCDecoderConfigurationRecord. The existing PPSs (if any) are retained iff
+@@ -285,7 +285,7 @@ class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+   VideoInfo mCurrentConfig;
+   uint32_t mStreamID = 0;
+   const bool mFullParsing;
+-#ifdef MOZ_WMF_MEDIA_ENGINE
++#if defined(MOZ_WMF_MEDIA_ENGINE) || defined(MOZ_WEBOS_MEDIA_ENGINE)
+   // True if the playback is performed by Windows Media Foundation Engine.
+   const bool mIsMediaEnginePlayback;
+ #endif
+diff --git a/gfx/webrender_bindings/WebRenderAPI.cpp b/gfx/webrender_bindings/WebRenderAPI.cpp
+index 41c0092894..a4c2a1b968 100644
+--- a/gfx/webrender_bindings/WebRenderAPI.cpp
++++ b/gfx/webrender_bindings/WebRenderAPI.cpp
+@@ -1413,6 +1413,15 @@ void DisplayListBuilder::PushRect(const wr::LayoutRect& aBounds,
+                   &mCurrentSpaceAndClipChain, aColor);
+ }
+ 
++void DisplayListBuilder::PushClearRect(const wr::LayoutRect& aBounds,
++                                       const wr::LayoutRect& aClip,
++                                       bool aIsBackfaceVisible) {
++  WRDL_LOG("PushClearRect b=%s cl=%s\n", mWrState, ToString(aBounds).c_str(),
++           ToString(aClip).c_str());
++  wr_dp_push_clear_rect(mWrState, aBounds, aClip, aIsBackfaceVisible,
++                        &mCurrentSpaceAndClipChain);
++}
++
+ void DisplayListBuilder::PushRoundedRect(const wr::LayoutRect& aBounds,
+                                          const wr::LayoutRect& aClip,
+                                          bool aIsBackfaceVisible,
+diff --git a/gfx/webrender_bindings/WebRenderAPI.h b/gfx/webrender_bindings/WebRenderAPI.h
+index 82e9800231..b624ea52f4 100644
+--- a/gfx/webrender_bindings/WebRenderAPI.h
++++ b/gfx/webrender_bindings/WebRenderAPI.h
+@@ -656,6 +656,10 @@ class DisplayListBuilder final {
+                              const wr::LayoutRect& aClip,
+                              bool aIsBackfaceVisible, const wr::ColorF& aColor,
+                              const WrAnimationProperty* aAnimation);
++  // Clears the window to transparent under aBounds so that a hardware video
++  // plane shows through there. Items pushed after it paint over the hole.
++  void PushClearRect(const wr::LayoutRect& aBounds, const wr::LayoutRect& aClip,
++                     bool aIsBackfaceVisible);
+   void PushRoundedRect(const wr::LayoutRect& aBounds,
+                        const wr::LayoutRect& aClip, bool aIsBackfaceVisible,
+                        const wr::ColorF& aColor);
+diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
+index a89cc039ea..282a6e727b 100644
+--- a/gfx/webrender_bindings/src/bindings.rs
++++ b/gfx/webrender_bindings/src/bindings.rs
+@@ -3434,6 +3434,26 @@ pub extern "C" fn wr_dp_push_rect(
+     state.frame_builder.dl_builder.push_rect(&prim_info, rect, color);
+ }
+ 
++/// A rectangle that clears the window to transparent where it lies
++/// (PrimitiveFlags::IS_CUTOUT). It is the hole a video shows through when it
++/// plays on a hardware plane under the window.
++#[no_mangle]
++pub extern "C" fn wr_dp_push_clear_rect(
++    state: &mut WrState,
++    rect: LayoutRect,
++    clip: LayoutRect,
++    is_backface_visible: bool,
++    parent: &WrSpaceAndClipChain,
++) {
++    debug_assert!(unsafe { !is_in_render_thread() });
++
++    let mut prim_info = common_item_properties_for_rect(state, clip, is_backface_visible, parent);
++    prim_info.flags |= PrimitiveFlags::IS_CUTOUT;
++
++    // Opaque black, because the colour's alpha is what dest-out removes.
++    state.frame_builder.dl_builder.push_rect(&prim_info, rect, ColorF::BLACK);
++}
++
+ #[no_mangle]
+ pub extern "C" fn wr_dp_push_rect_with_animation(
+     state: &mut WrState,
+diff --git a/gfx/wr/webrender/src/batch.rs b/gfx/wr/webrender/src/batch.rs
+index 3a15c9f6aa..3f811e2762 100644
+--- a/gfx/wr/webrender/src/batch.rs
++++ b/gfx/wr/webrender/src/batch.rs
+@@ -2,7 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-use api::{AlphaType, ClipMode, ImageBufferKind};
++use api::{AlphaType, ClipMode, ImageBufferKind, PrimitiveFlags};
+ use api::{FontInstanceFlags, YuvColorSpace, YuvFormat, ColorDepth, ColorRange, PremultipliedColorF};
+ use api::units::*;
+ use crate::clip::{clamped_radius, ClipNodeFlags, ClipNodeRange, ClipItemKind, ClipStore};
+@@ -2026,6 +2026,15 @@ impl BatchBuilder {
+                     0,
+                 );
+ 
++                // A cut-out clears the destination with opaque black and
++                // dest-out like add_compositor_surface_cutout does.
++                let is_cutout = common_data.flags.contains(PrimitiveFlags::IS_CUTOUT);
++                let (prim_cache_address, blend_mode) = if is_cutout {
++                    (ctx.globals.default_black_rect_address, BlendMode::PremultipliedDestOut)
++                } else {
++                    (prim_cache_address, blend_mode)
++                };
++
+                 let prim_header = PrimitiveHeader {
+                     specific_prim_address: prim_cache_address.as_int(),
+                     user_data: batch_params.prim_user_data,
+diff --git a/gfx/wr/webrender/src/prepare.rs b/gfx/wr/webrender/src/prepare.rs
+index 6470850b2c..fd63ecb56f 100644
+--- a/gfx/wr/webrender/src/prepare.rs
++++ b/gfx/wr/webrender/src/prepare.rs
+@@ -8,6 +8,7 @@
+ 
+ use api::{BoxShadowClipMode, ColorF, DebugFlags, ExtendMode, GradientStop, ImageBufferKind, RepeatMode};
+ use api::ClipMode;
++use api::PrimitiveFlags;
+ use crate::pattern::cutout::Cutout;
+ use crate::util::clamp_to_scale_factor;
+ use crate::box_shadow::{BoxShadowCacheKey, BLUR_SAMPLE_SCALE};
+@@ -1044,9 +1045,15 @@ fn prepare_interned_prim_for_render(
+                 let prim_data = &data_stores.prim[*data_handle];
+                 let prim_rect = prim_info.snapped_local_rect;
+                 let color = prim_data.resolve(frame_context.scene_properties);
++                let pattern: &dyn crate::pattern::PatternBuilder =
++                    if prim_data.common.flags.contains(PrimitiveFlags::IS_CUTOUT) {
++                        &Cutout
++                    } else {
++                        &color
++                    };
+ 
+                 quad::prepare_quad(
+-                    &color,
++                    pattern,
+                     &prim_rect,
+                     &prim_info.clip_chain.local_clip_rect,
+                     prim_data.common.aligned_aa_edges,
+diff --git a/gfx/wr/webrender/src/prim_store/rectangle.rs b/gfx/wr/webrender/src/prim_store/rectangle.rs
+index e8c4160b10..4f6666ff41 100644
+--- a/gfx/wr/webrender/src/prim_store/rectangle.rs
++++ b/gfx/wr/webrender/src/prim_store/rectangle.rs
+@@ -2,7 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-use api::{PropertyBinding, ColorU, ColorF, Shadow, RasterSpace};
++use api::{PropertyBinding, ColorU, ColorF, PrimitiveFlags, Shadow, RasterSpace};
+ use crate::scene_building::{CreateShadow, IsVisible};
+ use crate::intern;
+ use crate::internal_types::LayoutPrimitiveInfo;
+@@ -127,9 +127,14 @@ impl RectangleTemplate {
+         let mut writer = frame_state.frame_gpu_data.f32.write_blocks(1);
+         writer.push_one(scene_properties.resolve_color(&self.kind.color).premultiplied());
+         self.common.gpu_buffer_address = writer.finish();
+-        self.opacity = PrimitiveOpacity::from_alpha(
+-            scene_properties.resolve_color(&self.kind.color).a
+-        );
++        // A cut-out removes pixels, so it is never an opaque cover.
++        self.opacity = if self.common.flags.contains(PrimitiveFlags::IS_CUTOUT) {
++            PrimitiveOpacity::translucent()
++        } else {
++            PrimitiveOpacity::from_alpha(
++                scene_properties.resolve_color(&self.kind.color).a
++            )
++        };
+     }
+ }
+ 
+diff --git a/gfx/wr/webrender/src/tile_cache/mod.rs b/gfx/wr/webrender/src/tile_cache/mod.rs
+index 5205194881..a76ff24e96 100644
+--- a/gfx/wr/webrender/src/tile_cache/mod.rs
++++ b/gfx/wr/webrender/src/tile_cache/mod.rs
+@@ -2333,7 +2333,8 @@ impl TileCacheInstance {
+                 //           case for background rects is that they don't have animated opacity.
+                 let prim_color = data_stores.prim[data_handle].kind.color;
+                 let resolved = frame_context.scene_properties.resolve_color(&prim_color);
+-                if resolved.a >= 1.0 {
++                let is_cutout = data_stores.prim[data_handle].common.flags.contains(PrimitiveFlags::IS_CUTOUT);
++                if resolved.a >= 1.0 && !is_cutout {
+                     backdrop_candidate = Some(BackdropInfo {
+                         opaque_rect: pic_coverage_rect,
+                         spanning_opaque_color: None,
+diff --git a/gfx/wr/webrender_api/src/display_item.rs b/gfx/wr/webrender_api/src/display_item.rs
+index e601a6df4f..bee6c2f2c2 100644
+--- a/gfx/wr/webrender_api/src/display_item.rs
++++ b/gfx/wr/webrender_api/src/display_item.rs
+@@ -53,6 +53,11 @@ bitflags! {
+         const ANTIALISED = 1 << 4;
+         /// If true, this primitive is used as a background for checkerboarding
+         const CHECKERBOARD_BACKGROUND = 1 << 5;
++        /// A rectangle with this flag clears what is under it to transparent
++        /// instead of painting its colour. It uses dest-out like the cut-out
++        /// under an underlay compositor surface. Used where a video shows through
++        /// the window on a hardware plane the compositor composes beneath it.
++        const IS_CUTOUT = 1 << 6;
+     }
+ }
+ 
+diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
+index 32c65b7e56..55432dbefe 100644
+--- a/layout/generic/nsVideoFrame.cpp
++++ b/layout/generic/nsVideoFrame.cpp
+@@ -620,6 +620,12 @@ class nsDisplayVideo final : public nsPaintedDisplayItem {
+       nsDisplayListBuilder* aDisplayListBuilder) override {
+     HTMLVideoElement* element =
+         static_cast<HTMLVideoElement*>(Frame()->GetContent());
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++    if (element->RendersOnExternalPlane()) {
++      PushPlaneHole(aBuilder, element);
++      return true;
++    }
++#endif
+     gfxRect destGFXRect;
+     RefPtr<ImageContainer> container = GetImageContainer(destGFXRect);
+     if (!container) {
+@@ -638,6 +644,40 @@ class nsDisplayVideo final : public nsPaintedDisplayItem {
+     return true;
+   }
+ 
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // The TV's pipeline shows the frames on a plane under the window. Clear
++  // the window where the video is so that the plane shows through, and tell
++  // the element where that is on screen.
++  void PushPlaneHole(mozilla::wr::DisplayListBuilder& aBuilder,
++                     HTMLVideoElement* aElement) {
++    auto* f = static_cast<nsVideoFrame*>(Frame());
++    if (aElement->GetVideoSize().isNothing()) {
++      aElement->NotifyVideoPlaneRect(gfx::IntRect());
++      return;
++    }
++    nsRect destInFrame = f->GetDestRect(f->GetContentRectRelativeToSelf());
++    nsPresContext* pc = f->PresContext();
++    gfxRect destGfx =
++        pc->AppUnitsToGfxUnits(destInFrame + ToReferenceFrame());
++    destGfx.Round();
++    if (destGfx.IsEmpty()) {
++      aElement->NotifyVideoPlaneRect(gfx::IntRect());
++      return;
++    }
++    LayoutDeviceRect rect(destGfx.x, destGfx.y, destGfx.width,
++                          destGfx.height);
++    aBuilder.PushClearRect(wr::ToLayoutRect(rect), wr::ToLayoutRect(rect),
++                           !BackfaceIsHidden());
++
++    // On screen this is the frame's own place plus the dest rect inside it.
++    nsRect onScreen = destInFrame + f->GetScreenRectInAppUnits().TopLeft();
++    LayoutDeviceIntRect dev = LayoutDeviceIntRect::FromAppUnitsToNearest(
++        onScreen, pc->AppUnitsPerDevPixel());
++    aElement->NotifyVideoPlaneRect(
++        gfx::IntRect(dev.x, dev.y, dev.width, dev.height));
++  }
++#endif
++
+   // For opaque videos, we will want to override GetOpaqueRegion here.
+   // This is tracked by bug 1545498.
+ 
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+index c00a539cb2..fc5298c279 100644
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -12843,6 +12843,25 @@
+   value: true
+   mirror: always
+ 
++# Playback through LG webOS's media pipeline (WebOSEngine) when the
++# launcher has started a helper for it.
++- name: media.webos.engine.enabled
++  type: RelaxedAtomicBool
++  value: true
++  mirror: always
++
++# How far ahead of the pipeline's clock samples are handed over, in ms.
++- name: media.webos.engine.lead-ms
++  type: RelaxedAtomicInt32
++  value: 750
++  mirror: always
++
++# The same before the pipeline showed its first frame after a load or seek.
++- name: media.webos.engine.preroll-ms
++  type: RelaxedAtomicInt32
++  value: 2000
++  mirror: always
++
+ - name: media.decoder-doctor.testing
+   type: bool
+   value: false
+diff --git a/toolkit/moz.configure b/toolkit/moz.configure
+index 593f8b9b9c..ebb19e1d52 100644
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -830,6 +830,16 @@ set_define("MOZ_WMF", wmf)
+ set_config("MOZ_WMF_MEDIA_ENGINE", True, when=wmfmediaengine)
+ set_define("MOZ_WMF_MEDIA_ENGINE", True, when=wmfmediaengine)
+ 
++# LG webOS media engine, playback through the TV's own pipeline
++# ==============================================================
++option(
++    "--enable-webos-media-engine",
++    help="Enable playback through LG webOS's media pipeline",
++)
++
++set_config("MOZ_WEBOS_MEDIA_ENGINE", True, when="--enable-webos-media-engine")
++set_define("MOZ_WEBOS_MEDIA_ENGINE", True, when="--enable-webos-media-engine")
++
+ # FFmpeg H264/AAC Decoding Support
+ # ==============================================================
+ option("--disable-ffmpeg", help="Disable FFmpeg for fragmented H264/AAC decoding")

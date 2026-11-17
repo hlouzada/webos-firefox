@@ -1,13 +1,17 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "media-helper.h"
 
 /* Entry point. webOS runs this ELF, which sets up the environment and execs
  * the native 32-bit Firefox in firefox-runtime. */
@@ -243,7 +247,10 @@ int main(int argc, char **argv)
     int narg = 0;
     ssize_t n;
     char *slash;
+    int gl_window_mode = 0;
 
+    if (argc > 1 && strcmp(argv[1], "--media-helper") == 0)
+        return media_helper_main(argc, argv);
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n < 0)
         return 1;
@@ -313,14 +320,35 @@ int main(int argc, char **argv)
     /* The runtime's own libraries come first; its copy of libwayland-client
      * carries the webOS shell adapter. Everything else is the TV's. */
     snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
-    /* GTK needs libwayland-egl.so.1 to load. Newer webOS has it, matched to
-     * its Mali driver, and must keep using its own; webOS 4 has none, so
-     * then use the generic one bundled in firefox-runtime/fallback. */
+    /* GTK needs libwayland-egl.so.1 to load, and the Mali driver only draws
+     * into windows made by the library it was built with. Newer webOS has
+     * it under that name. webOS 6.5 ships it as libwayland-egl.so.0 only, so
+     * a link under the name GTK asks for goes first in the library path.
+     * glibc maps the file once, so Mali and GTK share it. webOS 4 has none
+     * and gets the generic one bundled in firefox-runtime/fallback. */
     if (access("/usr/lib/libwayland-egl.so.1", F_OK) != 0 &&
         access("/lib/libwayland-egl.so.1", F_OK) != 0) {
         size_t len = strlen(libpath);
-        snprintf(libpath + len, sizeof libpath - len, ":%s/firefox-runtime/fallback", dir);
-        fprintf(stderr, "geckotv: no libwayland-egl.so.1 on this TV, using the bundled one\n");
+        const char *tv = access("/usr/lib/libwayland-egl.so.0", F_OK) == 0
+                             ? "/usr/lib/libwayland-egl.so.0"
+                             : access("/lib/libwayland-egl.so.0", F_OK) == 0
+                                   ? "/lib/libwayland-egl.so.0" : NULL;
+        char linkdir[PATH_MAX];
+        char link[PATH_MAX];
+
+        snprintf(linkdir, sizeof linkdir, "%s/.wayland-egl", home);
+        snprintf(link, sizeof link, "%s/libwayland-egl.so.1", linkdir);
+        if (tv && len + strlen(linkdir) + 2 < sizeof libpath &&
+            (mkdir(linkdir, 0755) == 0 || errno == EEXIST) &&
+            (unlink(link) == 0 || errno == ENOENT) && symlink(tv, link) == 0) {
+            memmove(libpath + strlen(linkdir) + 1, libpath, len + 1);
+            memcpy(libpath, linkdir, strlen(linkdir));
+            libpath[strlen(linkdir)] = ':';
+            fprintf(stderr, "geckotv: libwayland-egl.so.1 is the TV's %s\n", tv);
+        } else {
+            snprintf(libpath + len, sizeof libpath - len, ":%s/firefox-runtime/fallback", dir);
+            fprintf(stderr, "geckotv: no libwayland-egl.so.1 on this TV, using the bundled one\n");
+        }
     }
     /* The runtime's GTK finds its image decoders through this cache. */
     snprintf(marker, sizeof marker, "%s/firefox-runtime/gdk-pixbuf/loaders.cache", dir);
@@ -440,18 +468,83 @@ int main(int argc, char **argv)
         int flat = flat_mode_compositor();
         int software;
 
+        /* A flat-mode compositor shows what the GPU draws only through the
+         * adapter's GL window mode (src/webos-xdg.c, gl_mode). That mode
+         * needs the TV's own wayland-egl library for the Mali driver. */
+        int wegl = access("/usr/lib/libwayland-egl.so.1", F_OK) == 0 ||
+                   access("/usr/lib/libwayland-egl.so.0", F_OK) == 0 ||
+                   access("/lib/libwayland-egl.so.1", F_OK) == 0 ||
+                   access("/lib/libwayland-egl.so.0", F_OK) == 0;
+        int gl = 0;
+
         if (forced && forced[0])
             software = atoi(forced) != 0;
         else
-            software = flat == 1;
+            software = flat == 1 && !wegl;
+        if (!software && flat == 1) {
+            gl = 1;
+            gl_window_mode = 1;
+            setenv("WEBOS_XDG_GL", "1", 1);
+            setenv("WEBOS_XDG_SIZE", "1920x1080", 0);
+        } else {
+            unsetenv("WEBOS_XDG_GL");
+        }
         if (flat >= 0 || (forced && forced[0])) {
             set_software_rendering(home, software);
-            fprintf(stderr, "geckotv: %s rendering (%s)\n", software ? "software" : "GPU",
+            fprintf(stderr, "geckotv: %s rendering (%s)%s\n", software ? "software" : "GPU",
                     forced && forced[0] ? "GECKOTV_SOFTWARE"
-                    : flat == 1        ? "flat-mode compositor"
-                                       : "compositor has wl_subcompositor or no wl_webos_foreign");
+                    : flat != 1         ? "compositor has wl_subcompositor or no wl_webos_foreign"
+                    : wegl              ? "flat-mode compositor with wayland-egl"
+                                        : "flat-mode compositor without wayland-egl",
+                    gl ? ", GL window mode" : "");
         } else {
             fprintf(stderr, "geckotv: compositor not reachable before start; rendering left as is\n");
+        }
+    }
+
+    /* Hardware video (src/media-helper.cc, findings.md section 21) in GL
+     * window mode on a TV with LG's Starfish pipeline library. Firefox's
+     * media engine starts the helper itself and the adapter listens on the
+     * socket for the video's place. GECKOTV_HWVIDEO=0|1 in the env file
+     * overrides. The socket lives in the profile folder under a name no
+     * other process knows, and only the app's user can read that folder. */
+    {
+        const char *forced = getenv("GECKOTV_HWVIDEO");
+        int starfish = access("/usr/lib/libplayerAPIs.so.1", R_OK) == 0;
+        int on = forced && forced[0] ? atoi(forced) != 0 : gl_window_mode && starfish;
+        DIR *dir = opendir(home);
+
+        if (dir) {
+            struct dirent *ent;
+
+            while ((ent = readdir(dir)) != NULL)
+                if (strncmp(ent->d_name, ".geckotv-video-", 15) == 0) {
+                    snprintf(marker, sizeof marker, "%s/%s", home, ent->d_name);
+                    unlink(marker);
+                }
+            closedir(dir);
+        }
+        if (on) {
+            unsigned tag = (unsigned)time(NULL) ^ ((unsigned)getpid() << 16);
+            int rfd = open("/dev/urandom", O_RDONLY);
+
+            if (rfd >= 0) {
+                if (read(rfd, &tag, sizeof tag) != (ssize_t)sizeof tag)
+                    tag ^= (unsigned)getpid();
+                close(rfd);
+            }
+            snprintf(marker, sizeof marker, "%s/.geckotv-video-%08x", home, tag);
+            setenv("GECKOTV_MEDIA_HELPER", exe, 1);
+            setenv("GECKOTV_VIDEO_SOCKET", marker, 1);
+            fprintf(stderr, "geckotv: hardware video on (%s)\n",
+                    forced && forced[0] ? "GECKOTV_HWVIDEO" : "GL window mode and Starfish present");
+        } else {
+            unsetenv("GECKOTV_MEDIA_HELPER");
+            unsetenv("GECKOTV_VIDEO_SOCKET");
+            fprintf(stderr, "geckotv: hardware video off (%s)\n",
+                    forced && forced[0] ? "GECKOTV_HWVIDEO"
+                    : !starfish        ? "no libplayerAPIs.so.1"
+                                       : "not in GL window mode");
         }
     }
 

@@ -577,9 +577,7 @@ display, config, context and surface calls with attributes and errors.
 Firefox opens `libEGL.so` before `libEGL.so.1`, so the tracer needs both
 names.
 
-**Not started:** hardware video decoding through LG's media stack, which
-needs a custom Firefox decoder module and handling for video shown on a
-separate display plane.
+**Hardware video decoding** through LG's media stack is section 21.
 
 ---
 
@@ -985,6 +983,160 @@ in a video while the toolbar and the address bar's drop-down drew; the app
 was killed for lack of memory about 3 s after the drop-down opened; and the
 tester saw flicker while scrolling the settings.
 
+**GPU rendering on this TV (2026-11-16).** The Mali driver never drew
+because of the wayland-egl library, not because of the compositor. webOS
+6.5 ships `/usr/lib/libwayland-egl.so.0` and no `.so.1`. The launcher and
+the GPU probe looked for `.so.1` only and loaded the bundled stand-in, and
+Mali is itself linked against the TV's `.so.0`, so it blocks in the first
+`eglSwapBuffers` on a window made by another library and sends no Wayland
+request at all. With the TV's library the probe renders 180 frames of
+1920x1080 on a window of its own in 3.6 s on the legacy and the platform
+display alike, and that time includes a 16 ms pause per frame. The
+launcher now links `libwayland-egl.so.1` to the TV's `.so.0` in the
+profile folder. Two more facts came out of the same rounds. A surface's
+`wl_surface.frame` request must reach the compositor, which answers it on
+that surface. The adapter's flat-mode virtual callbacks land on the default
+queue while Mali waits on its own queue. And a wl_shell toplevel with the
+app's webOS properties becomes the card directly. So the GPU path on this
+TV needs Firefox's GL content surface to be the window and not a copied
+subsurface. The pop-ups then need a surface the compositor shows above the
+card. In round 14 a `_WEBOS_WINDOW_TYPE_POPUP` surface minimized the card,
+untyped ones became cards and `_WEBOS_WINDOW_TYPE_SYSTEM_UI` was positioned
+by the compositor. `wl_webos_foreign` can also attach a surface into an
+exported region of the window, which is under test.
+
+**Pop-ups over a GPU window (rounds 17 to 22, 2026-11-16 and 17).**
+Round 17 was read wrongly. Its log showed every request answered. Window
+ids were assigned, surfaces attached and the window still drawing, and this
+file said the compositor drew the attached surfaces and the overlays. The
+tester had seen none of them. Rounds 18 to 22 ran on the same TV on
+2026-11-17 with the tester watching while the log was read, and they settle
+what the compositor does.
+
+- A surface imported into an exported region of the window is never drawn,
+  not even where the window is transparent, and an alpha 0 hole shows
+  black. That holds for `wl_webos_foreign` exports and imports as
+  transparent_object, opaque_object or video_object, with or without a
+  video_object export beside it, created before or after it. The compositor
+  offers `wl_webos_foreign` v1 only, so `set_z_index` and `set_property`
+  are not available. Firefox 0.1.40 to 0.1.44 attached every menu this way,
+  which is why the log showed menus opening while nothing appeared.
+- A second toplevel of the app with the app's properties and
+  `_WEBOS_WINDOW_TYPE` OVERLAY or FLOATING is drawn over the card and
+  blended. A full-screen transparent one shows the window beneath it still
+  drawing. SYSTEM_UI is not drawn. A surface smaller than the screen lands
+  at the top left wherever it asked to be. The moment such a surface is
+  destroyed the compositor minimizes the card with `state_changed` 1, for
+  every type and for full-screen and small surfaces alike. Mapping one does
+  not minimize it.
+- A process started from a root shell gets no pointer events on any of its
+  surfaces, so input routing can only be tested inside Firefox.
+
+**GL window mode (0.1.40, pop-ups 0.1.45).** With the TV's wayland-egl
+library and the adapter's GL window mode, Firefox renders with GPU
+WebRender on this TV at 1920x1080. The launcher sets `WEBOS_XDG_GL=1` on a
+flat-mode compositor that has `libwayland-egl.so.1` or `.so.0`. Firefox's
+content subsurface gets the wl_shell toplevel and the app's webOS
+properties and its requests pass through in `gl_window_set`. GTK's window
+surface is tagged and never shown, its frames are answered and its buffers
+released as in flat mode but without copying. Pop-ups are copied into one
+full-screen transparent surface of the app typed OVERLAY, made by
+`ov_ensure` once the GL window is shown and kept until Firefox exits,
+since destroying it would minimize the card. Firefox draws menus and
+panels in software because a pop-up without remote content gets no
+accelerated widget, so their buffers are shared memory and the flat-mode
+copy applies. The overlay's input region is empty, so pointer events
+arrive on the GL window and `ov_hit` sends them to the pop-up under them
+by rectangle. Mapping the overlay moves the keyboard focus to it and back,
+and the adapter reports both as GTK's window. On the tester's TV on
+2026-11-17 the hamburger menu, extensions, account, tab list and site
+identity pop-ups and tooltips were verified to draw and work, also while a
+YouTube video plays on the hardware plane (section 21). A second GTK
+toplevel still gets a card of its own as before.
+
+**Pop-ups drawn with the GPU (0.1.46).** Installing an add-on froze Firefox
+on that TV every time in three attempts on 2026-11-17. The install prompt
+opened and nothing appeared, the extensions button stayed pressed, and
+the log ended with `flat: surface X committed buffer Y the window cannot
+copy (not a wl_shm buffer of this process)`. Firefox's main thread sat in
+futex_wait with no crash and no minidump. Firefox gives a pop-up widget
+GPU acceleration only when its panel is marked `remote="true"`
+(`nsWindow::WidgetTypeSupportsAcceleration`, widget/gtk/nsWindow.cpp). The
+popup notifications panel `#notification-popup` in
+browser/base/content/popup-notifications.inc.xhtml is one, so unlike a
+menu the install prompt commits Mali buffers on its content subsurface.
+The overlay copies shared memory only, the pop-up was never shown, and
+the Mali swap waited for a frame callback of a surface the compositor
+never saw. Extension pop-ups themselves are not remote here because
+`extensions.webextensions.remote` is false, so only the hard-coded remote
+panels are affected.
+
+The adapter now gives such a surface a window of its own in `gp_attach`.
+At its first attach a pop-up content surface whose buffer is not from this
+process's `wl_shm` is taken out of the overlay, gets a wl_shell toplevel
+role and a webOS shell surface typed OVERLAY, and its attach, damage,
+frame and commit requests pass through. A shared-memory one is still tagged
+SUBSURFACE then and stays copied. Since the compositor minimizes the card
+the moment a surface of the app goes away, the window is never unmapped or
+destroyed. Firefox hides a pop-up by attaching no buffer and keeps the
+surface (WaylandSurface::UnmapLocked), so an empty attach is replaced by a
+transparent 1x1 buffer. The destroy request only comes when the widget
+dies, and it is swallowed and the surface parked behind that buffer. On
+the next show Firefox makes a new subsurface of GTK's new pop-up surface,
+and `gp_reparent` re-attaches the window to it. This TV's compositor sends
+the app no pointer events, so clicks come from evdev and are routed by
+rectangle. `apply_remote_event` now asks `ov_hit`, which knows the
+overlay's pop-ups and the GPU ones, so a click inside a pop-up reaches
+GTK's pop-up surface rather than the window. Keyboard focus on a GPU
+pop-up reads as GTK's window, as on the overlay. The webOS shell surface's
+`position_changed` event is logged to see where the compositor puts it.
+The host test is `tests/adapter/gpu-popup.c`.
+
+With the window typed OVERLAY it showed for half a second and Firefox was
+gone in three runs. A SIGTERM handler added to the adapter for the hunt
+showed the sender. `/usr/sbin/sam` sent it to every Firefox process right
+after LSM reported the card not visible, 400 ms after the new window
+mapped, with no Wayland error. The variants below ran from a one-off build
+with env knobs for the window's role, type, state, input region and
+hiding, and with a test hook that mapped a shared-memory window from the
+adapter some seconds after the GL window showed, so no add-on install was
+needed. They were launched from a shell with `ssh -tt` and then
+`luna-send-pub ... applicationManager/launch`, because without a terminal
+the bus answers nothing. Those knobs, the hook and the handler are gone
+again, and this record is what they found.
+
+- OVERLAY 446x286 with or without an input region, and OVERLAY 1920x1080.
+  The keyboard focus moves to the new window with a `KEYBOARD enter` on it
+  and no return, LSM hides the card 300 to 400 ms later, and SAM closes the
+  app. The startup overlay survives only because it maps during the launch
+  transition.
+- FLOATING 446x286. No focus change, the card stays, the window shows,
+  hides behind the transparent buffer and the app lives on.
+
+- FLOATING 446x286 as a toplevel or as a transient with the inactive flag.
+  Three runs of four went as above and stayed alive. In the fourth the
+  focus moved to the window 400 ms after it mapped and the app died the
+  same way, so a FLOATING window is spared only while nothing activates it.
+
+So GPU pop-ups are typed FLOATING and get an empty input region with
+Firefox's own set_input_region on them swallowed, so a click or hover of
+the Magic Remote cannot pick the window. The adapter's hit test routes the
+clicks. A transient role with the inactive flag made no difference to a
+FLOATING window and is not used.
+
+On the TV the FLOATING window lands at the top left whatever it asked, and
+LSM sends no `position_changed`, so clicks are taken there.
+`WEBOS_XDG_GPU_POPUP_PLACED=asked` is for a compositor that honours the
+place. With that the add-on install prompt shows and its buttons work.
+Two things were found on the way. The content surface of a second GTK
+toplevel is a pop-up child to the adapter too. A tab torn off the strip
+makes one. A window of its own for it hid the card and closed the app, so
+only the content of a surface with an xdg_popup role is promoted. And
+clicks routed into a pop-up left the synthetic pointer focus on its GTK
+surface after GTK destroyed it, so the next click sent a leave for freed
+memory and crashed with SIGSEGV at 0xe5e5e5e5 twice. The focus is dropped
+when its surface is destroyed.
+
 **The keyboard crash (0.1.28).** On that TV Firefox closed whenever a text
 field lost focus (Wikipedia's search box, the address bar, other pages):
 `invalid arguments for text_model@NN.set_max_text_length`, then
@@ -1111,3 +1263,360 @@ jemalloc_stats_lite. It now prints the offset from the file's first mapping.
 The unstripped binaries are in /work/obj-nc4/dist/bin (the shipped nc4
 build; obj-nc4-gcc is the failed GCC experiment), and
 /work/nc4/out/build/*/ has the unstripped GTK stack.
+
+---
+
+## 21. Hardware video decoding through LG's media stack
+
+### The media server decodes for us (2026-11-16)
+
+`experiments/luna-media/media-test.sh` was run as root on a webOS 6.5.3-47
+TV. It loads a public 1080p60 H.264 clip through
+`luna://com.webos.media/load`, plays it for 15 s and records the service's
+events. One round ran as root and one with
+`luna-send -a com.github.gprot42.geckotv`, and both behaved the same.
+
+- `resourceInfo` listed `{"type":"VDEC","portNumber":2}` and `videoInfo`
+  reported `vdec_ch: 2`, 1920x1080 and 60 fps, so the pipeline assigned a
+  hardware decoder channel to the clip.
+- `loadCompleted` and `playing` arrived, and `currentTime` advanced about
+  200 ms every 200 ms with no stall. Nothing of this ran in our process.
+- The clip has no audio track (`numAudioTracks: 0`), so there was nothing to
+  hear. No window id was passed, so whether a picture appeared is not
+  recorded. Without one the decoded frames have no video plane.
+
+So LG's pipeline will decode H.264 at 1080p60 for this app id with no
+permission change. 4K and HEVC are untested but take the same path.
+
+### How a native app gets elementary streams into that pipeline
+
+The URL player above is not what a browser needs, because Firefox demuxes
+itself and has compressed frames to hand over. LG's API for that is
+**NDL_DirectMedia v2** in `libNDL_directmedia.so.1` on webOS 5 and later.
+The header travels with LG's native SDK and with homebrew projects such as
+moonlight-tv. What follows is known about it from those projects' notes and
+from the TV.
+
+- `NDL_DirectMediaInit(appId)`, `NDL_DirectMediaSetWindowId(id)`,
+  `NDL_DirectMediaLoad(&info, callback)` with the codec and size, then
+  `NDL_DirectVideoPlay(buffer, size, pts)` per access unit in Annex B form,
+  `NDL_DirectVideoSetArea(x, y, w, h)` for the picture's place,
+  `NDL_DirectVideoFlushRenderBuffer`, `NDL_DirectMediaUnload`,
+  `NDL_DirectMediaQuit`. The codec is one of H.264, HEVC, VP9 and AV1. The
+  Load callback events are 0x16 loaded, 0x1a playing and 0x17 unloaded. PTS
+  is in milliseconds.
+- It must be loaded with `dlopen` and is not thread safe. It accepts data
+  without back-pressure, and a whole clip fed at once freezes the picture,
+  so the feeder paces. Stopping the feed holds the last frame, and feeding
+  again resumes.
+- The bus role is keyed on the executable path. `LSRegister` succeeds from
+  the app's own `main` executable and nowhere else, so the code that calls
+  NDL has to run as `geckotv` and not as Firefox.
+- LG's implementation runs a GStreamer pipeline in the calling process on
+  the TV's GLib. Firefox's runtime bundles its own GLib and GTK, so NDL
+  cannot live inside a Firefox process. Both facts point to a helper
+  process started from the launcher binary and fed by Firefox.
+- The decoded picture is a hardware plane under the graphics plane. The app
+  has to leave its window transparent where the video shows, and the
+  compositor only honours that for the foreground app. The window exports a
+  region for the video through `wl_webos_foreign` (`src/webos-foreign.xml`),
+  and the exported window id goes into `NDL_DirectMediaSetWindowId`.
+
+### Starfish: the pipeline that paces, plays audio and reports its clock
+
+NDL in its game mode shows a frame when it receives it, so a helper feeding
+it has to be the presentation clock, and the helper written for it first
+stuttered on the webOS 6.5.3 TV. That helper was never committed.
+LG's other interface is `StarfishMediaAPIs` in `libplayerAPIs.so.1`, which
+LG's own browser and the native players PlxNative, webos-native-app-kit and
+Kodi use. Both elementary streams go into one pipeline that decodes, paces
+by presentation time, plays the audio and reports the time of the frame on
+screen. The facts below come from those projects and the TV, measured there
+on webOS 6.5.3 unless noted.
+
+- One C++ object made by `new StarfishMediaAPIs(nullptr)`, then
+  `notifyForeground()`, `Load(json, callback, data)` with
+  `mediaTransportType` BUFFERSTREAM, `Feed(json)` per access unit answering
+  a string with `Ok` or `BufferFull`, `Play`, `Pause`, `flush`,
+  `Seek("<ms>")`, `pushEOS`, `setVolume`, `Unload`. The Feed payload carries
+  `bufferAddr`, `bufferSize`, `pts` in ns and `esData` 1 for video and 2 for
+  audio. The events are FRAMEREADY 0x0 with the presentation time in ns,
+  LOADCOMPLETED 0x16, PLAYING 0x1a, PAUSED 0x1b, ENDOFSTREAM 0x1c, SEEKDONE
+  0x19, and errors 0x12 and 0x13. `Play()` before LOADCOMPLETED is queued
+  and re-issued at LOADCOMPLETED.
+- The picture's place on webOS 5 and later is `option.windowId` in the Load
+  payload. That is the id of a window exported through `wl_webos_foreign`,
+  and the exported window's destination region places the plane. Older
+  ports use `libAcbAPI.so.1` for that, and it is absent from 5.3.1 on.
+- `Seek` after `flush()` runs a FLUSH|KEY_UNIT seek and starts a new
+  segment at the milliseconds passed. The kit calls `Seek(<its own ms>)`
+  with the first packet fed after the flush. The first new frame comes 0.17
+  to 0.33 s after the request with no dropped frames.
+- Declaring a frame rate above the stream's judders. 24p declared at 60
+  came out at 13 fps presented. So the stream's rate is declared.
+- `SetPlayRate` does not work for buffer feeding. AAC goes in as ADTS
+  frames. Opus is not taken as is.
+- The library's symbols are the cxx11 string ABI
+  (`_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc`), so a caller built against
+  another libstdc++ reads the returned string by its layout and frees its
+  buffer with `free()`.
+
+### What is built (2026-11-16)
+
+Hardware video works only in GL window mode, on webOS 5 and 6 with a GPU.
+The flat window of software rendering copies frames on the CPU and has no
+alpha the compositor would blend. There are four pieces.
+
+- **Firefox's media engine** is `build/patches/webos-media-engine.patch`
+  (`dom/media/platforms/webos/`), an `ExternalPlaybackEngine` for
+  Firefox's own `ExternalEngineStateMachine`. That state machine is the
+  machinery Windows uses for its Media Foundation engine. The patch is
+  built with `--enable-webos-media-engine`. A media decoder picks that
+  state machine when `media.webos.engine.enabled` is set and the launcher
+  exported `GECKOTV_MEDIA_HELPER`. The engine takes unencrypted H.264 or
+  VP9 with AAC or no audio. Anything else, and anything the pipeline
+  refuses before it is loaded, ends in
+  `NS_ERROR_DOM_MEDIA_EXTERNAL_ENGINE_NOT_SUPPORTED_ERR` and Firefox's
+  normal state machine plays in software from the same position. That
+  hand-over now seeks to the position, where before it restarted at 0. The
+  engine starts `geckotv --media-helper` with a socketpair on fd 3 and a
+  clean environment, and talks to it in requests and replies
+  (`src/media-protocol.h`) from one task queue. Every 25 ms it hands over
+  the one sample per track that waits in it when that sample's time is
+  within the lead of the pipeline's clock, and otherwise asks for the
+  pipeline's state. The lead is 750 ms, or 2 s until the pipeline has
+  shown a frame. Every reply carries the time of the frame on screen, which
+  is the engine's clock. The pass-through decoders of
+  `WebOSEngineDecoderModule` run in the content process and are registered
+  first. They only act on decoders created with the engine's id, and the
+  RDD module refuses those, so no sample of an engine playback is decoded
+  elsewhere. They return placeholder frames, and Firefox's A/V logic,
+  seeking and ready states keep working on them. A seek moves the clock to
+  the target, drops the waiting samples, sends `SEEK` to the helper and
+  posts `Seeked` at once, while the state machine still waits for the
+  demuxer's seek. A playback rate other than 1 hands over to software.
+  Looping, picture-in-picture and `drawImage` of the video are not served
+  by the plane.
+- **The helper** is `src/media-helper.cc`. It is C++ with libstdc++ linked
+  statically and hidden, and it is a mode of the launcher so that it runs
+  under the app's bus role and with the TV's libraries. It `dlopen`s
+  `libplayerAPIs.so.1` and calls the members through their mangled names as
+  free functions. On ARM EABI `this` goes in r0, and for a returned
+  std::string the slot goes in r0 and `this` in r1. `Load` runs on a thread
+  of its own because it can block for seconds or for ever, while the socket
+  loop keeps answering so that Firefox can give up and kill the helper.
+  After a `flush()` the first video packet is fed with `Seek(<its ms>)` in
+  front, and FRAMEREADY events between the two are dropped as belonging to
+  the old position. `tests/media-helper/run.sh` drives it on the build host
+  against a stub `libplayerAPIs.so.1` that exports the TV's symbol names.
+- **The hole.** Firefox clears the window to alpha 0 where the video is, so
+  the compositor shows the plane through it and the controls, captions and
+  everything else painted after the video stay on top. LG's browser does
+  the same with Chromium's video hole quad. WebRender already had the
+  operation. Its `Cutout` pattern is a dest-out blend that cuts the
+  picture-cache tile under an underlay compositor surface. The patch
+  exposes it as a display item. A rectangle with `PrimitiveFlags::IS_CUTOUT`
+  draws that pattern on the quad path or opaque black with dest-out on the
+  brush path, is never taken as an opaque backdrop, and reaches Gecko as
+  `DisplayListBuilder::PushClearRect`. `nsVideoFrame` pushes it instead of
+  the frames while the element's decoder reports that the engine renders,
+  and reports the video's rectangle on screen (window device pixels) to
+  the element, the decoder, the state machine and the engine. The content
+  slice's tiles are opaque because they hold the page canvas, and opaque
+  tiles are composited with blending off, so the zeros reach the
+  framebuffer. Firefox marks the chrome's opaque parts as the surface's
+  opaque region, which would let the compositor skip blending there, so
+  the adapter drops `wl_surface.set_opaque_region` on the GL window.
+- **The adapter** exports one video element on the GL window through
+  `wl_webos_foreign` (`src/webos-xdg.c`, `video_*`). It listens on the unix
+  socket the launcher named in the profile folder under a random name,
+  checks the peer uid, takes one client at a time and replaces a gone
+  client at once. It sends the client `windowid <id>` and takes
+  `rect x y w h vw vh` lines. The destination region is the rect clipped to
+  the window, and the source region is the part of the natural `vw x vh`
+  video that lands in it. `rect 0 0 0 0 0 0` or a closed socket clears the
+  region. `tests/adapter/run.sh` checks the clipping on the host.
+- **The launcher** sets `GECKOTV_MEDIA_HELPER` and `GECKOTV_VIDEO_SOCKET`
+  in GL window mode when `/usr/lib/libplayerAPIs.so.1` exists.
+  `GECKOTV_HWVIDEO=0|1` in the `env` file overrides.
+
+### First TV round (webOS 6.5, 2026-11-16)
+
+A direct H.264 + AAC mp4 of 320x176 at 25 fps played through the pipeline.
+The helper started under the app's role, loaded with the exported window
+id, the pipeline reported PLAYING and the adapter placed the plane under
+the hole (`video plane at 800,519 320x176`). The picture showed through the
+window with the page over it, so the compositor blends the GL window's
+alpha. The pipeline reached end of stream after the clip's 10 s.
+
+The picture stuttered. The engine was handing over one sample per track
+per 25 ms tick. That is 40 samples/s and below AAC's 47 frames/s at
+48 kHz, so the pipeline's audio clock starved. Samples now go out as they
+arrive from the reader with one in flight per track and a round trip under
+a few ms, and the tick only releases samples held back for the lead.
+
+A second run of the same clip on the same build played without stutter,
+so the round-5 stutter had at least one other cause. The throughput cap
+stands as a defect on its own because a longer clip drains the 2 s preroll.
+
+YouTube refused the engine. It negotiated Opus audio with VP9 video in
+WebM containers, Firefox fell back to its own state machine, and that path
+failed after the first frames. `media.mediasource.webm.enabled` no longer
+exists in ESR 153, so the pref this build set was dead. With reader
+logging the raiser is Firefox's bundled VP9 decoder on the `vp09.00.51`
+stream, which logs `FFmpegVideoDecoder::DoDecode: avcodec_send_packet
+error: Invalid data found when processing input`. After that the reader
+finds no next keyframe to skip to and raises the bare
+`NS_ERROR_DOM_MEDIA_FATAL_ERR`. A control run with
+`media.webos.engine.enabled=false` fails identically, so this predates the
+engine. YouTube then retries with H.264 and the TV's FFmpeg fails the same
+way on it with `Invalid data found`, so software decoding of YouTube's
+streams is broken on this build for a reason of its own that is not yet
+looked into. `MediaSource.isTypeSupported` now refuses codecs the pipeline
+has no decoder for while the engine is available, so a site negotiates
+H.264/VP9 + AAC as it does with LG's browser. That browser's Media Source
+support is the pipeline's.
+
+Both played on the pipeline with 0.1.43 and the leftover pref stripped.
+The mp4 with H.264 + AAC fed 250 video and 470 audio samples to end of
+stream. YouTube now negotiated VP9 1920x1080 at 60 fps with AAC
+(`webOS engine supported=1`, `LOAD at 0 us, 58824/1000 fps`), loaded in
+about a second, placed the plane under the player (`video plane at
+107,213 1470x827`) following the layout as the page resized it, and
+advanced its position in real time with 13.9 s of media after 14 s.
+
+A direct mp4 opened two media decoders in one session, so two helpers ran
+two pipelines on VDEC ports 2 and 3, and the TV has two decoders. The
+adapter's video socket takes one client, so the second engine ran with no
+window id and no picture. Why the media document made two decoders is open.
+
+Script notes. `pkill -f firefox-runtime` over ssh kills the remote shell
+that runs it because its own command line matches, so use `firefo[x]`. A
+pref set through `user.js` for one run stays in `prefs.js` after the file
+is removed. The launcher's note on `gfx.webrender.software` describes the
+same trap. A control run with `media.webos.engine.enabled=false` switched
+the engine off for the rounds after it until the line was stripped.
+
+### To check on the TV
+
+Check these in order in `geckotv.log` after playing a local H.264 + AAC
+clip in a page and then YouTube.
+
+- `media-helper: started` and `Starfish library loaded` mean the helper
+  runs under the app's role with the TV's libraries.
+- `video window exported as <id>` from the adapter and
+  `open: ... window <id>` from the helper mean the id reached the Load
+  payload.
+- `load completed`, then `event 0x1a` (PLAYING) and time advancing in the
+  engine's log (`MOZ_LOG=WebOSEngine:4` in the `env` file).
+- `video plane at x,y wxh` from the adapter and the picture inside the
+  element with the page's controls over it mean the hole and the plane
+  agree. A black rectangle instead means the compositor did not blend the
+  window's alpha, and the adapter's `opaque region dropped` line says
+  whether Firefox asked for one.
+- Whether `set_exported_window`'s source region crops the video or is
+  ignored. The adapter passes the natural video rect and the compositor
+  scales it.
+- Seek with the remote. Expect `flushed for a seek`, `Seek(<ms>) ok`, a new
+  frame within 0.5 s and sound in sync.
+- Two videos on one page. Whether the second Load is refused or the first
+  pipeline is preempted by a policy action with no error event.
+- Killing the helper mid-play with `kill -9` and starting a new video.
+  Whether the decoder was released.
+- Lip sync and 24 fps content on the 60 Hz panel. `videoFpsValue` is the
+  stream's rate.
+
+## 22. Fixed: jumping in an HLS video froze it (2026-11-17)
+
+Seen on miruro.tv and animepahe.ch, both HLS through MediaSource with
+hls.js. A jump left the player spinning with the target range shown as
+buffered, or showed a black plane that never came back. Two causes were
+found with `MOZ_LOG=WebOSEngine:5,MediaDecoder:4,MediaFormatReader:4,MediaSource:4`
+in the `env` file. The state machine logs under `MediaDecoder`, and a
+module named `ExternalEngineStateMachine` does not exist.
+
+**The reader kept a cancel as a fatal error.** `WebOSEngineChannel::Seek`
+rejected the sample waiting in the channel with `NS_ERROR_DOM_MEDIA_CANCELED`.
+When that reached `MediaFormatReader` before the reader's own flush, the
+log showed `NotifyError: Video Decoding error: NS_ERROR_DOM_MEDIA_CANCELED`
+right before `Reset(Video) BEGIN`. `DecoderData::HasFatalError()` treats
+every error but `DECODE_ERR` and the process-crash codes as fatal,
+`ResetState()` keeps a fatal error across the reset, and
+`UpdateReceivedNewData()` returns before it resolves the `WaitForData`
+promise, so the seek sat in `SeekingData` for good once hls.js had the
+segment appended (buffered 582 to 630 s, target 587 s), and nothing
+reported it because no data promise was pending to reject. Whether a
+sample was in flight at the instant of the seek decided it. That is why
+some jumps worked. The engine now drops the stale samples and leaves their
+promises to the reader's flush like other decoders do. Sites' players issue
+every seek twice with the same target. That is harmless.
+
+**The decoder died on a level switch.** A jump often lands on a fragment of
+another HLS level. Firefox's `H264ChangeMonitor` sees the in-band SPS
+differ from the init segment, re-creates the pass-through decoder and feeds
+the new IDR with its SPS. The SPS differed as 1920x1080 with a 46 byte avcC
+against 854x480 with 50 bytes. `omxh264dec` then reports `OpenMAX component
+in error state Insufficient resources`, Starfish raises error 100, the
+engine fails and the page recreates the element. The new element loads at
+the same position and dies again. 33 of the 50 error-100 events in the
+day's log carry that OMX line. `WebOSEngineDecoderModule` now tells the
+channel the configuration of every video decoder it creates. When image
+size or extradata differ from the current stream while a pipeline is
+loaded, the channel sends `GM_UNLOAD` and the `pipeline gone` path loads
+again at the position with the next sample. `GM_UNLOAD` is new in
+`src/media-protocol.h` and calls the helper's `Unload()`. The host test is
+scenario `reload` in `tests/media-helper/run.sh`. A level change seen
+before the first load only updates the stored configuration.
+
+Confirmed on the TV with 0.1.50 over nine distinct jumps across two
+episodes, all `Seek completed` and no cancel in the reader. `WebOSEngine:5`
+now logs every `submit` and `fed` sample.
+
+**Log volume.** `MediaFormatReader:4` and `MediaDecoder:4` together write
+about a megabyte per ten seconds of playback and far more while a page
+recreates players in a loop. One six minute run wrote 400 MB and filled the
+2.3 GB app partition, and from then on the install service refuses
+packages. Truncate `geckotv.log` and delete `env` right after a logged run.
+
+### Open, seen in the same logs
+
+- **Ad clips take the hardware decoder.** The pages carry silent 300x250
+  and 950x250 H.264 clips. Each gets its own helper and pipeline, the TV has
+  one `VDEC`, and the resource manager answers with `event 0x12 601
+  Resource Allocation Error` for the loser, or takes the decoder from the
+  pipeline that has it with `event 0x12 600 VDEC resource is released by
+  policy action`. That second event killed the main 1280x720 video after
+  534 frames at 20:11 UTC. The proposed rule is not decided yet. A video
+  with no audio track and 480 lines or less would not use the engine and
+  would decode in software, so the decoder stays with the main video. The
+  check would go in `IsFormatSupportedByExternalEngine` or in the engine's
+  `Init`. The open question is what else is silent and small and should
+  stay on the plane.
+- **A second engine while the first shuts down gets no window.** When a
+  page swaps its video element, the new `WebOSEngineChannel` starts before
+  the old one has closed the adapter socket, logs `no exported window id
+  from the adapter`, opens with `window none`, loads with
+  `"windowId":""`, and every feed answers `RETRY` until the pipeline dies
+  with error 100. The page's retry then gets a window and plays. Section
+  21 lists the one-client socket. The options are to let the adapter
+  accept a second client and hand it the same window, or to make the new
+  channel wait for the socket. The old channel's `adapter link lost: Broken
+  pipe` marks the moment the socket frees.
+- **The state machine spins after an engine failure.** From the failure
+  until the page recreates the element, `ExternalEngineStateMachine`
+  logs `OnRequestAudio ErrorName=NS_ERROR_DOM_MEDIA_CANCELED` about a
+  thousand times per two thousand log lines (6822 in one run, 20850 in
+  another). `OnRequestAudio` re-requests on `CANCELED` at once and the
+  reader rejects at once while its seek promise is pending. This is
+  upstream code and a CPU burner on a 4-core TV. A check in the `CANCELED`
+  branch that the state is still running, or a short delay, would stop it.
+- **A `signal 7` at close.** Closing the app while a video plays prints
+  `webos-xdg: signal 7 addr=0xe5e5e5e9` with a thread id below the content
+  process's pid, so from the parent, then the content process exits with
+  `Exiting due to channel error`. The address is the freed-memory poison,
+  so this is a use-after-free. Seen at several closes with a video playing
+  in today's logs, never during playback. It is harmless to the user and a
+  real bug for a crash reporter. The handler printed bare `pc`/`lr`
+  addresses here instead of `library+offset`, so `build/symbolize-arm32.py`
+  has nothing to resolve yet, and `libxul` from `mach package` has no
+  symbols anyway.

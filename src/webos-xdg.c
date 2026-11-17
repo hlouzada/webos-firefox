@@ -11,8 +11,10 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <ucontext.h>
@@ -26,6 +28,7 @@
 #include "text-model-client-protocol.h"
 #include "text-input-unstable-v3-client-protocol.h"
 #include "webos-surface-group-client-protocol.h"
+#include "webos-foreign-client-protocol.h"
 
 /* Compiled into libwayland-client. Requests are intercepted after
  * libwayland has parsed the argument list, then translated onto the
@@ -79,6 +82,8 @@ struct virt {
     int injected_ddm;
     int injected_sub;
     int configured;
+    /* For V_TOPLEVEL, set between set_fullscreen and unset_fullscreen. */
+    int fullscreen;
     /* V_SUBSURFACE: the surfaces it joins, as Firefox asked. */
     struct wl_proxy *sub_child;
     struct wl_proxy *sub_parent;
@@ -677,7 +682,8 @@ static void emit_popup_configure(struct virt *popup)
         return;
     emitting = 1;
     for (i = 0; i < MAX_VIRT; i++) {
-        if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == popup->wl_surface) {
+        if (g.virts[i].proxy && g.virts[i].kind == V_SURFACE &&
+            g.virts[i].wl_surface == popup->wl_surface) {
             surface = &g.virts[i];
             break;
         }
@@ -760,19 +766,21 @@ static void emit_toplevel_configure(struct virt *toplevel)
         return;
     emitting = 1;
     for (i = 0; i < MAX_VIRT; i++) {
-        if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == toplevel->wl_surface) {
+        if (g.virts[i].proxy && g.virts[i].kind == V_SURFACE &&
+            g.virts[i].wl_surface == toplevel->wl_surface) {
             surface = &g.virts[i];
             break;
         }
     }
     g.serial++;
-    /* Fullscreen state makes Firefox slide the tab strip and address bar
-     * off the top. The compositor still shows the surface full-screen via
-     * wl_webos_shell; tell the client it is a maximized window instead. */
+    /* These states do not change what LSM shows, which is always the full
+     * card. FULLSCREEN is needed because GDK turns it into the window-state
+     * event Firefox waits for before requestFullscreen() completes. */
     wl_array_init(&states);
     state = wl_array_add(&states, sizeof *state);
     if (state)
-        *state = XDG_TOPLEVEL_STATE_MAXIMIZED;
+        *state = toplevel->fullscreen ? XDG_TOPLEVEL_STATE_FULLSCREEN
+                                      : XDG_TOPLEVEL_STATE_MAXIMIZED;
     state = wl_array_add(&states, sizeof *state);
     if (state)
         *state = XDG_TOPLEVEL_STATE_ACTIVATED;
@@ -789,13 +797,27 @@ static void emit_toplevel_configure(struct virt *toplevel)
     }
     toplevel->configured = 1;
     emitting = 0;
-    log_msg("configure serial %u", g.serial);
+    log_msg("configure serial %u fullscreen=%d", g.serial, toplevel->fullscreen);
 }
 
 static int flat_mode(void);
 static void flat_pump_start(void);
 static struct wl_proxy *flat_window_for(struct wl_proxy *gtk_surface);
 static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shell_surface *ws);
+static int gl_mode(void);
+static void gl_main_mapped(struct virt *xdg_surface, struct wl_proxy *gtk_surface);
+static void gl_window_set(struct wl_proxy *child);
+static void gl_surface_destroyed(struct wl_proxy *surface);
+static struct wl_proxy *gl_window;  /* in GL window mode Firefox's content surface, the card */
+static int gl_window_shown;
+static int gl_window_commit(struct wl_proxy *surface, int attached);
+static struct wl_proxy *gl_main_surface(void);
+static void gl_pending_add(struct wl_proxy *child, struct wl_proxy *parent);
+static struct wl_proxy *gp_input_popup(struct wl_proxy *surface, int32_t *off_x, int32_t *off_y);
+static int gp_reparent(struct wl_proxy *child, struct wl_proxy *popup);
+static int gp_offset(struct wl_proxy *child, int32_t x, int32_t y);
+static void gp_popup_moved(struct wl_proxy *popup);
+static void gp_popup_gone(struct wl_proxy *popup);
 
 static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surface)
 {
@@ -809,6 +831,10 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
     xdg_surface->wl_surface = wl_surface;
     if (!g.shell || !wl_surface) {
         log_msg("cannot map shell=%p surface=%p", (void *)g.shell, (void *)wl_surface);
+        return;
+    }
+    if (gl_mode() && !mapped_one) {
+        gl_main_mapped(xdg_surface, wl_surface);
         return;
     }
     /* In flat mode the window the compositor sees is the overlay surface. */
@@ -857,9 +883,11 @@ static void map_main_surface(struct virt *xdg_surface, struct wl_proxy *wl_surfa
 /* Undo what the adapter created for a virtual object and free its slot. */
 static void virt_teardown(struct virt *v)
 {
+    /* The synthetic pointer focus must never outlive its surface. A leave
+     * sent for a destroyed surface is a use after free in GDK. */
+    if (v->wl_surface && synth_focus == (struct wl_surface *)v->wl_surface)
+        synth_focus = NULL;
     if (v->subsurface) {
-        if (synth_focus == (struct wl_surface *)v->wl_surface)
-            synth_focus = NULL;
         wl_subsurface_destroy(v->subsurface);
         v->subsurface = NULL;
     }
@@ -1001,6 +1029,10 @@ static struct wl_surface *input_surface(struct wl_surface *surface)
 {
     if (ov_surface && surface == ov_surface && main_surface)
         return main_surface;
+    if (gl_mode() && surface && surface == (struct wl_surface *)gl_window && main_surface)
+        return main_surface;
+    if (gl_mode() && gp_input_popup((struct wl_proxy *)surface, NULL, NULL) && main_surface)
+        return main_surface;
     return is_layered(surface) && main_surface ? main_surface : surface;
 }
 
@@ -1069,6 +1101,18 @@ static void emulate_subsurface(struct wl_proxy *child, struct wl_proxy *parent)
 {
     int i;
 
+    if (gl_mode() && child && parent) {
+        /* The first window's content surface becomes the card, untagged. A
+         * pop-up's content is copied into the overlay as in flat mode. */
+        if (parent == gl_main_surface()) {
+            gl_window_set(child);
+        } else if (!gl_main_surface()) {
+            gl_pending_add(child, parent);
+        } else if (!gp_reparent(child, parent)) {
+            ov_child(child, parent);    /* tagged at its first attach by gp_attach */
+        }
+        return;
+    }
     tag_child_surface(child);
     if (child && parent && flat_mode()) {   /* copied into the flat window */
         ov_child(child, parent);
@@ -1268,6 +1312,258 @@ static int ov_flat_test(void)
 }
 static uint32_t *ov_canvas;
 static int32_t ov_w, ov_h;
+
+/* Hardware video in GL window mode. LG's media pipeline is fed by
+ * geckotv --media-helper for Firefox's webOS media engine. It shows the
+ * picture on a plane under the graphics, inside a region of the window
+ * exported through wl_webos_foreign. Firefox clears the window to alpha 0
+ * where the video is, so the plane shows through. The engine runs in
+ * Firefox's content process. It connects on the unix socket
+ * GECKOTV_VIDEO_SOCKET, gets "windowid <id>" and sends "rect x y w h vw vh"
+ * with the video's place in window pixels and its natural size. The
+ * destination region is the rect clipped to the window and the source
+ * region is the matching part of the natural video. "rect 0 0 0 0 0 0" or
+ * a closed socket clears the region. */
+static struct wl_webos_exported *video_exported;
+static char video_window_id[128];
+static int video_listen_fd = -1;
+static int video_client_fd = -1;
+static int video_id_unsent;        /* window id to send under ov_mu */
+static int32_t video_rect[4];      /* the last region set as x y w h, all 0 for none */
+static char video_line[256];
+static size_t video_line_len;
+
+static struct wl_webos_foreign *gl_foreign_get(void);
+static struct wl_compositor *gl_compositor_get(void);
+static struct wl_proxy *gl_window;  /* defined with the GL window state below */
+
+/* The regions for a video of vw x vh shown at rect, given as x y w h in
+ * window pixels. dst is rect clipped to the win_w x win_h window and src is
+ * the part of the video that lands in it. Returns 0 when nothing of it is
+ * visible. */
+static int video_clip(const int32_t rect[4], int32_t vw, int32_t vh, int32_t src[4],
+                      int32_t dst[4])
+{
+    int32_t x0 = rect[0], y0 = rect[1], x1 = rect[0] + rect[2], y1 = rect[1] + rect[3];
+
+    if (rect[2] <= 0 || rect[3] <= 0 || vw <= 0 || vh <= 0)
+        return 0;
+    if (x0 < 0)
+        x0 = 0;
+    if (y0 < 0)
+        y0 = 0;
+    if (x1 > win_w)
+        x1 = win_w;
+    if (y1 > win_h)
+        y1 = win_h;
+    if (x1 <= x0 || y1 <= y0)
+        return 0;
+    dst[0] = x0;
+    dst[1] = y0;
+    dst[2] = x1 - x0;
+    dst[3] = y1 - y0;
+    src[0] = (int32_t)((int64_t)(x0 - rect[0]) * vw / rect[2]);
+    src[1] = (int32_t)((int64_t)(y0 - rect[1]) * vh / rect[3]);
+    src[2] = (int32_t)((int64_t)(x1 - rect[0]) * vw / rect[2]) - src[0];
+    src[3] = (int32_t)((int64_t)(y1 - rect[1]) * vh / rect[3]) - src[1];
+    if (src[2] < 1)
+        src[2] = 1;
+    if (src[3] < 1)
+        src[3] = 1;
+    return 1;
+}
+
+/* Under ov_mu. */
+static void video_region_set(const int32_t rect[4], int32_t vw, int32_t vh)
+{
+    int32_t src[4], dst[4] = { 0, 0, 0, 0 };
+    struct wl_region *source, *destination;
+
+    if (!video_exported || !gl_compositor_get())
+        return;
+    if (!video_clip(rect, vw, vh, src, dst))
+        memset(dst, 0, sizeof dst);
+    if (!memcmp(dst, video_rect, sizeof dst) && dst[2] == 0)
+        return;
+    memcpy(video_rect, dst, sizeof video_rect);
+    source = wl_compositor_create_region(gl_compositor_get());
+    destination = wl_compositor_create_region(gl_compositor_get());
+    if (dst[2] > 0) {
+        wl_region_add(source, src[0], src[1], src[2], src[3]);
+        wl_region_add(destination, dst[0], dst[1], dst[2], dst[3]);
+    }
+    wl_webos_exported_set_exported_window(video_exported, source, destination);
+    wl_region_destroy(source);
+    wl_region_destroy(destination);
+    if (dst[2] > 0)
+        log_msg("video plane at %d,%d %dx%d (source %d,%d %dx%d of %dx%d)", dst[0], dst[1],
+                dst[2], dst[3], src[0], src[1], src[2], src[3], vw, vh);
+    else
+        log_msg("video plane hidden");
+}
+
+static void video_client_gone(const char *why)
+{
+    static const int32_t none[4] = { 0, 0, 0, 0 };
+
+    if (video_client_fd < 0)
+        return;
+    log_msg("video client gone (%s)", why);
+    close(video_client_fd);
+    video_client_fd = -1;
+    video_line_len = 0;
+    video_region_set(none, 0, 0);
+}
+
+static void video_send(const char *line)
+{
+    if (video_client_fd < 0)
+        return;
+    if (send(video_client_fd, line, strlen(line), MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
+        errno != EAGAIN)
+        video_client_gone(strerror(errno));
+}
+
+static void video_send_window_id(void)
+{
+    char line[160];
+
+    if (!video_window_id[0])
+        return;
+    snprintf(line, sizeof line, "windowid %s\n", video_window_id);
+    video_send(line);
+}
+
+/* Runs on the thread dispatching Wayland events. The socket is used only
+ * under ov_mu, so the id is sent from there. */
+static void video_window_id_assigned(void *data, struct wl_webos_exported *exported,
+                                     const char *id, uint32_t type)
+{
+    (void)data;
+    (void)exported;
+    pthread_mutex_lock(&ov_mu);
+    snprintf(video_window_id, sizeof video_window_id, "%s", id ? id : "");
+    video_id_unsent = 1;
+    pthread_mutex_unlock(&ov_mu);
+    log_msg("video window exported as %s (type %u)", video_window_id, type);
+}
+
+static const struct wl_webos_exported_listener video_exported_listener = {
+    video_window_id_assigned
+};
+
+static void video_socket_ensure(void)
+{
+    const char *path = getenv("GECKOTV_VIDEO_SOCKET");
+    struct sockaddr_un addr;
+    mode_t old;
+
+    if (video_listen_fd >= 0 || !path || !path[0] || strlen(path) >= sizeof addr.sun_path)
+        return;
+    video_listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (video_listen_fd < 0)
+        return;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    unlink(path);
+    old = umask(077);
+    if (bind(video_listen_fd, (struct sockaddr *)&addr, sizeof addr) != 0 ||
+        listen(video_listen_fd, 1) != 0) {
+        log_msg("video socket %s: %s", path, strerror(errno));
+        close(video_listen_fd);
+        video_listen_fd = -1;
+    } else {
+        log_msg("video socket %s", path);
+    }
+    umask(old);
+}
+
+/* Under ov_mu, once the GL window exists. */
+static void video_export_ensure(void)
+{
+    if (video_exported || !gl_window || !getenv("GECKOTV_VIDEO_SOCKET") || !gl_foreign_get())
+        return;
+    video_exported = wl_webos_foreign_export_element(
+        gl_foreign_get(), (struct wl_surface *)gl_window,
+        WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
+    wl_webos_exported_add_listener(video_exported, &video_exported_listener, NULL);
+}
+
+/* "rect x y w h vw vh" from the client. */
+static void video_client_line(char *line)
+{
+    int32_t v[6];
+
+    if (sscanf(line, "rect %d %d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6)
+        video_region_set(v, v[4], v[5]);
+    else
+        log_msg("video client said: %s", line);
+}
+
+static void video_client_read(void)
+{
+    ssize_t n;
+    char *start, *nl;
+
+    n = recv(video_client_fd, video_line + video_line_len,
+             sizeof video_line - 1 - video_line_len, MSG_DONTWAIT);
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+        video_client_gone("closed");
+        return;
+    }
+    if (n < 0)
+        return;
+    video_line_len += (size_t)n;
+    video_line[video_line_len] = '\0';
+    start = video_line;
+    while ((nl = strchr(start, '\n')) != NULL) {
+        *nl = '\0';
+        video_client_line(start);
+        start = nl + 1;
+    }
+    video_line_len = strlen(start);
+    memmove(video_line, start, video_line_len + 1);
+    if (video_line_len == sizeof video_line - 1)
+        video_line_len = 0;
+}
+
+/* One client at a time, and only one started by this user. A client that
+ * went away makes room for the next one at once. Called every 20 ms under
+ * ov_mu from flat_pump. */
+static void video_accept(void)
+{
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+    int fd;
+
+    if (video_listen_fd < 0)
+        return;
+    if (video_client_fd >= 0) {
+        struct pollfd p = { video_client_fd, POLLIN, 0 };
+
+        if (poll(&p, 1, 0) > 0)
+            video_client_read();
+    }
+    fd = accept4(video_listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0) {
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != getuid()) {
+            log_msg("video socket: refused a connection from uid %u", (unsigned)cred.uid);
+            close(fd);
+        } else if (video_client_fd >= 0) {
+            log_msg("video socket: a second client refused");
+            close(fd);
+        } else {
+            video_client_fd = fd;
+            log_msg("video client connected (pid %d)", (int)cred.pid);
+            video_id_unsent = 1;
+        }
+    }
+    if (video_client_fd >= 0 && video_id_unsent && video_window_id[0]) {
+        video_id_unsent = 0;
+        video_send_window_id();
+    }
+}
 static int ov_failed;
 /* Pointer: the pop-up GTK is told the pointer is in, while it is on the overlay. */
 static int ov_ptr_on;
@@ -1501,6 +1797,9 @@ static int ov_ensure(void)
 
     if (ov_surface)
         return 1;
+    /* The overlay maps after the card, or it would become the card. */
+    if (gl_mode() && !gl_window_shown)
+        return 0;
     if (ov_failed || !g.registry || (!main_group && !flat_mode()) || !host_compositor_name ||
         !host_shm_name)
         return 0;
@@ -1532,10 +1831,41 @@ static int ov_ensure(void)
     wl_shm_pool_destroy(pool);
     close(fd);
     ov_surface = wl_compositor_create_surface(ov_compositor);
+    if (gl_mode()) {
+        /* A second toplevel of the app typed OVERLAY. The compositor of a
+         * webOS 6.5 TV draws it over the card, blended (findings.md section
+         * 19). It takes no input, so the pointer stays on the GL window.
+         * It is never destroyed because the card is minimized the moment a
+         * second surface of the app goes away. */
+        struct wl_region *none;
+
+        ss = shell_role((struct wl_proxy *)ov_surface);
+        if (ss)
+            wl_shell_surface_set_toplevel(ss);
+        if (g.webos) {
+            struct wl_webos_shell_surface *ws =
+                wl_webos_shell_get_shell_surface(g.webos, ov_surface);
+
+            if (ws) {
+                wl_webos_shell_surface_set_property(ws, "appId", our_app_id());
+                wl_webos_shell_surface_set_property(ws, "displayAffinity", "0");
+                wl_webos_shell_surface_set_property(ws, "_WEBOS_WINDOW_TYPE",
+                                                    "_WEBOS_WINDOW_TYPE_OVERLAY");
+            }
+        }
+        none = wl_compositor_create_region(ov_compositor);
+        wl_surface_set_input_region(ov_surface, none);
+        wl_region_destroy(none);
+        ov_shown = 1;
+        log_msg("pop-up overlay %p, %dx%d: an OVERLAY window over the GL window",
+                (void *)ov_surface, ov_w, ov_h);
+        return 1;
+    }
     if (flat_mode()) {
         /* The window itself: map_toplevel gives it the window's roles. */
         ov_shown = 1;
         log_msg("flat window %p, %dx%d", (void *)ov_surface, ov_w, ov_h);
+        video_socket_ensure();
         return 1;
     }
     tag_surface_as((struct wl_proxy *)ov_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
@@ -1601,7 +1931,7 @@ static void ov_redraw(void)
 
     if (!ov_ensure())
         return;
-    if (flat_mode()) {
+    if (flat_mode() && !gl_mode()) {
         /* The window itself: opaque. A webOS 6.5 TV seems never to draw a
          * fully transparent frame (the first ones, before Firefox has drawn)
          * nor answer its frame callbacks, and Firefox waits for those. */
@@ -1648,7 +1978,8 @@ static void ov_redraw(void)
             for (x = bx; x < bx + 96 && x < ov_w; x++)
                 ov_canvas[(size_t)y * ov_w + x] = 0xffffffffu;
     }
-    wl_surface_set_input_region(ov_surface, region);
+    if (!gl_mode())
+        wl_surface_set_input_region(ov_surface, region);
     wl_region_destroy(region);
     b = ov_free[0] ? 0 : ov_free[1] ? 1 : -1;
     /* A webOS 6.5 TV never releases the flat window's buffers (0 releases
@@ -1742,6 +2073,7 @@ static void ov_popup_at(struct wl_proxy *surface, int32_t x, int32_t y)
         ov_popups[i].x = x;
         ov_popups[i].y = y;
         ov_item_add(surface, surface);
+        gp_popup_moved(surface);
         ov_update();
     }
     pthread_mutex_unlock(&ov_mu);
@@ -1760,6 +2092,7 @@ static void ov_popup_gone(struct wl_proxy *surface)
         ov_popups[p].surface = NULL;
         if (ov_ptr_popup == (struct wl_surface *)surface)
             ov_ptr_popup = NULL;
+        gp_popup_gone(surface);
         ov_update();
     }
     pthread_mutex_unlock(&ov_mu);
@@ -1795,6 +2128,8 @@ static int ov_child_offset(struct wl_proxy *child, int32_t x, int32_t y)
 {
     struct ov_item *it;
 
+    if (gp_offset(child, x, y))
+        return 1;
     pthread_mutex_lock(&ov_mu);
     it = ov_item_find(child);
     if (it && it->popup != child) {
@@ -1990,6 +2325,7 @@ static void *flat_pump(void *unused)
     for (;;) {
         usleep(20 * 1000);
         pthread_mutex_lock(&ov_mu);
+        video_accept();
         if ((ov_dirty || ov_flat_test()) && ov_surface)
             ov_update();
         flat_answer_maybe();
@@ -2026,6 +2362,563 @@ static void flat_window_shown(struct wl_proxy *gtk_surface, struct wl_webos_shel
     if (ws)
         wl_webos_shell_surface_set_state(ws, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
     log_msg("flat window shown for %p", (void *)gtk_surface);
+}
+
+/* GL window mode (WEBOS_XDG_GL=1 on a flat-mode compositor). Firefox draws
+ * with the GPU, and the Mali driver's buffers cannot be copied the way the
+ * flat window copies shared memory. So Firefox's content surface (the
+ * subsurface under GTK's first window) is the window the compositor sees.
+ * It gets the wl_shell toplevel and the app's wl_webos_shell properties,
+ * and its requests pass through. GTK's own window surface is never shown.
+ * As in flat mode its frame callbacks are answered here and its buffers
+ * released, without copying. Pop-ups are copied into the overlay
+ * (ov_ensure). That is a second window of the app over the card, since the
+ * compositor of a webOS 6.5 TV never draws a surface imported into a region
+ * of the window through wl_webos_foreign (findings.md section 19). Pointer
+ * and keyboard events come on the window and go to GTK's window, or to the
+ * pop-up under the pointer. The GL state is read and written under ov_mu. */
+#define GL_PENDING 8
+static struct wl_proxy *gl_main;    /* GTK's first window surface */
+static struct wl_shell_surface *gl_shell;
+static struct wl_webos_shell_surface *gl_webos;
+static struct wl_webos_foreign *gl_foreign;
+static struct wl_compositor *gl_compositor;
+static int gl_window_buffer;       /* a buffer was attached since the last commit */
+/* Content surfaces seen before their parent had a role. */
+static struct { struct wl_proxy *child, *parent; } gl_pending[GL_PENDING];
+
+static int gl_mode(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_GL");
+        int want = e && *e == '1';
+
+        /* flat_mode is only known once the registry has been read. */
+        if (!want)
+            on = 0;
+        else if (host_foreign_name || host_subcompositor_name)
+            on = flat_mode();
+        else
+            return 0;
+        if (on)
+            log_msg("GL window mode: Firefox's content surface is the window");
+    }
+    return on;
+}
+
+static struct wl_proxy *gl_main_surface(void)
+{
+    return gl_main;
+}
+
+static void gl_pending_add(struct wl_proxy *child, struct wl_proxy *parent)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING && gl_pending[i].child; i++)
+        ;
+    if (i == GL_PENDING) {
+        log_msg("GL mode: too many content surfaces waiting for a parent, %p dropped",
+                (void *)child);
+        return;
+    }
+    gl_pending[i].child = child;
+    gl_pending[i].parent = parent;
+    log_msg("GL mode: content surface %p of %p kept until its parent has a role", (void *)child,
+            (void *)parent);
+}
+
+static struct wl_proxy *gl_pending_take(struct wl_proxy *parent)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING; i++)
+        if (gl_pending[i].child && gl_pending[i].parent == parent) {
+            struct wl_proxy *child = gl_pending[i].child;
+
+            gl_pending[i].child = gl_pending[i].parent = NULL;
+            return child;
+        }
+    return NULL;
+}
+
+static void gl_pending_drop(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; i < GL_PENDING; i++)
+        if (gl_pending[i].child == surface || gl_pending[i].parent == surface)
+            gl_pending[i].child = gl_pending[i].parent = NULL;
+}
+
+static void gl_main_mapped(struct virt *xdg_surface, struct wl_proxy *gtk_surface)
+{
+    struct wl_proxy *child;
+
+    (void)xdg_surface;
+    pthread_mutex_lock(&ov_mu);
+    gl_main = gtk_surface;
+    main_surface = (struct wl_surface *)gtk_surface;
+    mapped_one = 1;
+    pthread_mutex_unlock(&ov_mu);
+    text_input_enter_main();
+    flat_pump_start();
+    /* Never shown. No card, frames answered and buffers released here. */
+    tag_surface_as(gtk_surface, "_WEBOS_WINDOW_TYPE_SUBSURFACE");
+    ov_popup_at(gtk_surface, 0, 0);
+    log_msg("GL mode: GTK's window %p mapped, waiting for Firefox's content surface",
+            (void *)gtk_surface);
+    pthread_mutex_lock(&ov_mu);
+    child = gl_pending_take(gtk_surface);
+    pthread_mutex_unlock(&ov_mu);
+    if (child)
+        gl_window_set(child);
+}
+
+/* Firefox's content surface, the card. The first content committed to it
+ * maps it. Full screen is asked for again right after that commit because
+ * webOS 6 ignores it on an empty surface. */
+static void gl_window_set(struct wl_proxy *child)
+{
+    pthread_mutex_lock(&ov_mu);
+    if (gl_window == child) {
+        pthread_mutex_unlock(&ov_mu);
+        return;
+    }
+    if (gl_window) {
+        log_msg("GL window %p replaced by %p", (void *)gl_window, (void *)child);
+        if (gl_webos) {
+            wl_webos_shell_surface_destroy(gl_webos);
+            gl_webos = NULL;
+        }
+        forget_shell_role(gl_window);
+        gl_shell = NULL;
+    }
+    gl_window = child;
+    gl_window_buffer = gl_window_shown = 0;
+    bind_named();
+    gl_shell = shell_role(child);
+    if (gl_shell)
+        wl_shell_surface_set_toplevel(gl_shell);
+    if (g.webos) {
+        gl_webos = wl_webos_shell_get_shell_surface(g.webos, (struct wl_surface *)child);
+        if (gl_webos) {
+            wl_webos_shell_surface_set_property(gl_webos, "appId", our_app_id());
+            wl_webos_shell_surface_set_property(gl_webos, "title", "Firefox");
+            wl_webos_shell_surface_set_property(gl_webos, "displayAffinity", "0");
+            wl_webos_shell_surface_set_property(gl_webos, "_WEBOS_ACCESS_POLICY_KEYS_BACK",
+                                                "true");
+            wl_webos_shell_surface_set_key_mask(gl_webos, 0xFFFFFFFAu);
+            wl_webos_shell_surface_set_property(gl_webos, "_WEBOS_CURSOR_SLEEP_TIME", "-1");
+            video_socket_ensure();
+            video_export_ensure();
+            wl_webos_shell_surface_set_state(gl_webos, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+        }
+    }
+    log_msg("GL window %p: shell=%p webos=%p", (void *)child, (void *)gl_shell, (void *)gl_webos);
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* attached is 1 for an attach request with a buffer, 0 for one without and
+ * -1 for a commit. Returns 1 when the request was sent here. That happens
+ * for the first content commit, followed by the fullscreen request. */
+static int gl_window_commit(struct wl_proxy *surface, int attached)
+{
+    int sent = 0;
+
+    pthread_mutex_lock(&ov_mu);
+    if (gl_window && surface == gl_window) {
+        if (attached >= 0) {
+            gl_window_buffer = attached;
+        } else if (gl_window_buffer && !gl_window_shown) {
+            gl_window_shown = 1;
+            ov_inside = 1;
+            wl_surface_commit((struct wl_surface *)surface);
+            if (gl_webos)
+                wl_webos_shell_surface_set_state(gl_webos,
+                                                 WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+            ov_inside = 0;
+            log_msg("GL window %p shown", (void *)surface);
+            sent = 1;
+        } else {
+            gl_window_buffer = 0;
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return sent;
+}
+
+/* GL window mode, pop-ups Firefox draws with the GPU. A pop-up widget is
+ * accelerated when its panel holds remote content. The popup notifications
+ * panel with the add-on install prompt is one. Their Mali buffers cannot
+ * be copied into the overlay, so such a content surface becomes a toplevel
+ * of its own with its requests passed through. A webOS 6.5 TV imposes four
+ * constraints. The window is typed FLOATING because an OVERLAY toplevel
+ * mapped after the launch takes the keyboard focus, the card is hidden and
+ * the app manager closes the app. It is never unmapped or destroyed
+ * because either hides the card the same way. A hidden pop-up carries a
+ * transparent 1x1 buffer, Firefox's destroy of the surface is swallowed,
+ * and the next show re-attaches the surviving window to GTK's new pop-up
+ * surface (gp_reparent). It has an empty input region, so the compositor
+ * never picks it for a click. Clicks are injected from evdev because the
+ * compositor sends no pointer events, and they hit the window where the
+ * compositor shows it. That is the top left here rather than where the
+ * pop-up asked to be. WEBOS_XDG_GPU_POPUP_PLACED=asked takes the clicks at
+ * the asked place, for a compositor that honours it. */
+#define GP_ITEMS 16
+static struct gp_item {
+    struct wl_proxy *surface;      /* Firefox's content surface, the toplevel */
+    struct wl_proxy *popup;        /* GTK's pop-up surface, the one GTK knows */
+    int32_t x, y;                  /* the pop-up's place in the window, as asked */
+    int32_t off_x, off_y;          /* the content's offset in the pop-up */
+    int32_t px, py;                /* where the compositor shows the window */
+    int32_t w, h;
+    int shown;                     /* a buffer of Firefox's is attached */
+    int gone;                      /* destroyed by Firefox, kept hidden */
+    int placed;                    /* px,py came from position_changed */
+} gp_items[GP_ITEMS];
+static struct wl_buffer *gp_blank;  /* 1x1 transparent, attached while hidden */
+
+static struct gp_item *gp_find(struct wl_proxy *surface)
+{
+    int i;
+
+    for (i = 0; surface && i < GP_ITEMS; i++)
+        if (gp_items[i].surface == surface)
+            return &gp_items[i];
+    return NULL;
+}
+
+/* The pop-up's size, from its xdg_positioner. */
+static void gp_popup_size(struct wl_proxy *popup, int32_t *w, int32_t *h)
+{
+    int i;
+
+    *w = *h = 0;
+    for (i = 0; popup && i < MAX_VIRT; i++)
+        if (g.virts[i].proxy && g.virts[i].kind == V_POPUP && g.virts[i].wl_surface == popup) {
+            *w = g.virts[i].p_w;
+            *h = g.virts[i].p_h;
+            return;
+        }
+}
+
+/* With ov_mu held. */
+static void gp_place(struct gp_item *it)
+{
+    int p = ov_popup_slot(it->popup);
+
+    it->x = p >= 0 ? ov_popups[p].x : 0;
+    it->y = p >= 0 ? ov_popups[p].y : 0;
+    gp_popup_size(it->popup, &it->w, &it->h);
+    if (!it->placed) {
+        const char *placed = getenv("WEBOS_XDG_GPU_POPUP_PLACED");
+        int asked = placed && !strcmp(placed, "asked");
+
+        it->px = asked ? it->x + it->off_x : 0;
+        it->py = asked ? it->y + it->off_y : 0;
+    }
+}
+
+static void gp_webos_position(void *data, struct wl_webos_shell_surface *ws, int32_t x,
+                              int32_t y)
+{
+    struct gp_item *it = data;
+
+    (void)ws;
+    log_msg("GPU pop-up %p: position_changed %d,%d (asked %d,%d)", (void *)it->surface, x, y,
+            it->x + it->off_x, it->y + it->off_y);
+    pthread_mutex_lock(&ov_mu);
+    it->px = x;
+    it->py = y;
+    it->placed = 1;
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* libwayland skips the events this leaves NULL. */
+static const struct wl_webos_shell_surface_listener gp_webos_listener = {
+    .position_changed = gp_webos_position,
+};
+
+/* With ov_mu held. */
+static struct wl_buffer *gp_blank_ensure(void)
+{
+    struct wl_shm_pool *pool;
+    int fd;
+
+    if (gp_blank)
+        return gp_blank;
+    if (!ov_shm)        /* ov_shm is bound with the overlay, up before any pop-up */
+        return NULL;
+    fd = ov_memfd(4);
+    if (fd < 0)
+        return NULL;
+    ov_inside = 1;
+    pool = wl_shm_create_pool(ov_shm, fd, 4);
+    gp_blank = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    ov_inside = 0;
+    close(fd);
+    return gp_blank;
+}
+
+/* A pop-up's content surface committed a buffer that is not shared memory
+ * of this process, so it gets a window of its own. With ov_mu held. */
+static void gp_promote(struct wl_proxy *surface, struct ov_item *ov)
+{
+    struct gp_item *it = NULL;
+    struct wl_shell_surface *ss;
+    struct wl_webos_shell_surface *ws;
+    int i;
+
+    for (i = 0; i < GP_ITEMS && !it; i++)
+        if (!gp_items[i].surface)
+            it = &gp_items[i];
+    if (!it) {
+        log_msg("GPU pop-up %p: table full, left to the overlay (not drawn)", (void *)surface);
+        return;
+    }
+    memset(it, 0, sizeof *it);
+    it->surface = surface;
+    it->popup = ov->popup;
+    it->off_x = ov->off_x;
+    it->off_y = ov->off_y;
+    it->shown = 1;
+    ov_item_drop(ov);
+    gp_place(it);
+    bind_named();
+    ov_inside = 1;
+    ss = shell_role(surface);
+    if (ss)
+        wl_shell_surface_set_toplevel(ss);
+    ws = g.webos ? wl_webos_shell_get_shell_surface(g.webos, (struct wl_surface *)surface) : NULL;
+    if (ws) {
+        wl_webos_shell_surface_add_listener(ws, &gp_webos_listener, it);
+        wl_webos_shell_surface_set_property(ws, "appId", our_app_id());
+        wl_webos_shell_surface_set_property(ws, "displayAffinity", "0");
+        wl_webos_shell_surface_set_property(ws, "_WEBOS_WINDOW_TYPE",
+                                            "_WEBOS_WINDOW_TYPE_FLOATING");
+    }
+    if (ov_compositor) {
+        struct wl_region *none = wl_compositor_create_region(ov_compositor);
+
+        wl_surface_set_input_region((struct wl_surface *)surface, none);
+        wl_region_destroy(none);
+    }
+    ov_inside = 0;
+    log_msg("GPU pop-up %p of %p: its own FLOATING window, asked %d,%d %dx%d, clicks taken "
+            "at %d,%d (shell=%p webos=%p)",
+            (void *)surface, (void *)it->popup, it->x + it->off_x, it->y + it->off_y, it->w,
+            it->h, it->px, it->py, (void *)ss, (void *)ws);
+}
+
+/* wl_surface.attach on any surface, before the overlay sees it. A pop-up's
+ * content surface is tagged at its first shared-memory buffer, or promoted
+ * at its first GPU buffer. Firefox hides a pop-up by attaching nothing, and
+ * a promoted surface then gets the transparent buffer instead. */
+static void gp_attach(struct wl_proxy *surface, struct wl_proxy **buffer)
+{
+    struct gp_item *it;
+    struct ov_item *ov;
+
+    pthread_mutex_lock(&ov_mu);
+    it = gp_find(surface);
+    if (it) {
+        if (*buffer) {
+            it->shown = 1;
+        } else {
+            *buffer = (struct wl_proxy *)gp_blank_ensure();
+            it->shown = 0;
+            if (*buffer)
+                log_msg("GPU pop-up %p hidden behind the transparent buffer", (void *)surface);
+            else
+                log_msg("GPU pop-up %p: no transparent buffer (no wl_shm), unmapped instead",
+                        (void *)surface);
+        }
+        pthread_mutex_unlock(&ov_mu);
+        return;
+    }
+    ov = ov_item_find(surface);
+    if (ov && ov->popup != surface && *buffer) {
+        int32_t w, h;
+
+        gp_popup_size(ov->popup, &w, &h);
+        if (ov_buf_find(*buffer)) {
+            tag_child_surface(surface);
+        } else if (ov_popup_slot(ov->popup) >= 0 && w > 0 && h > 0) {
+            gp_promote(surface, ov);
+        } else {
+            static int told;
+
+            /* A second GTK toplevel's content is one case. Its card is not
+             * shown here, and a window of its own would hide the card. */
+            if (told++ < 4)
+                log_msg("GPU buffer on %p, a child of %p that is no pop-up: left alone",
+                        (void *)surface, (void *)ov->popup);
+        }
+    }
+    pthread_mutex_unlock(&ov_mu);
+}
+
+/* wl_surface.destroy on a GPU pop-up is swallowed and the surface stays
+ * hidden. Returns 1 when the request must not go out. */
+static int gp_destroy(struct wl_proxy *surface)
+{
+    struct gp_item *it;
+    struct wl_buffer *blank;
+
+    pthread_mutex_lock(&ov_mu);
+    it = gp_find(surface);
+    if (!it) {
+        pthread_mutex_unlock(&ov_mu);
+        return 0;
+    }
+    blank = gp_blank_ensure();
+    ov_inside = 1;
+    wl_surface_attach((struct wl_surface *)surface, blank, 0, 0);
+    if (blank)
+        wl_surface_damage((struct wl_surface *)surface, 0, 0, 1, 1);
+    wl_surface_commit((struct wl_surface *)surface);
+    ov_inside = 0;
+    it->shown = 0;
+    it->gone = 1;
+    log_msg("GPU pop-up %p destroyed by Firefox: kept %s", (void *)surface,
+            blank ? "behind the transparent buffer" : "unmapped");
+    pthread_mutex_unlock(&ov_mu);
+    return 1;
+}
+
+/* Firefox shows a pop-up again. Its content surface keeps its window and
+ * moves to GTK's new pop-up surface. Returns 1 if it was one. */
+static int gp_reparent(struct wl_proxy *child, struct wl_proxy *popup)
+{
+    struct gp_item *it;
+
+    pthread_mutex_lock(&ov_mu);
+    it = gp_find(child);
+    if (it && !it->gone) {
+        it->popup = popup;
+        it->off_x = it->off_y = 0;
+        gp_place(it);
+        log_msg("GPU pop-up %p shown again in pop-up %p", (void *)child, (void *)popup);
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return it && !it->gone;
+}
+
+static int gp_offset(struct wl_proxy *child, int32_t x, int32_t y)
+{
+    struct gp_item *it;
+
+    pthread_mutex_lock(&ov_mu);
+    it = gp_find(child);
+    if (it) {
+        it->off_x = x;
+        it->off_y = y;
+        gp_place(it);
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return it != NULL;
+}
+
+/* With ov_mu held. */
+static void gp_popup_moved(struct wl_proxy *popup)
+{
+    int i;
+
+    for (i = 0; i < GP_ITEMS; i++)
+        if (gp_items[i].surface && gp_items[i].popup == popup)
+            gp_place(&gp_items[i]);
+}
+
+/* With ov_mu held. The xdg_popup is gone and Firefox hides the content next. */
+static void gp_popup_gone(struct wl_proxy *popup)
+{
+    int i;
+
+    for (i = 0; i < GP_ITEMS; i++)
+        if (gp_items[i].surface && gp_items[i].popup == popup)
+            gp_items[i].shown = 0;
+}
+
+/* The GTK pop-up whose GPU content is at x,y of the window, and its origin.
+ * With ov_mu held. */
+static struct wl_surface *gp_hit(int32_t x, int32_t y, int32_t *ox, int32_t *oy)
+{
+    struct wl_surface *hit = NULL;
+    int i;
+
+    for (i = 0; i < GP_ITEMS; i++) {
+        struct gp_item *it = &gp_items[i];
+
+        if (!it->surface || !it->shown || !it->popup)
+            continue;
+        if (x >= it->px && x < it->px + it->w && y >= it->py && y < it->py + it->h) {
+            hit = (struct wl_surface *)it->popup;
+            *ox = it->px - it->off_x;
+            *oy = it->py - it->off_y;
+        }
+    }
+    return hit;
+}
+
+/* Input the compositor sends to a GPU pop-up's surface belongs to GTK's
+ * pop-up surface, offset by the content's place in it. */
+static struct wl_proxy *gp_input_popup(struct wl_proxy *surface, int32_t *off_x, int32_t *off_y)
+{
+    struct gp_item *it;
+    struct wl_proxy *popup = NULL;
+
+    pthread_mutex_lock(&ov_mu);
+    it = gp_find(surface);
+    if (it) {
+        popup = it->popup;
+        if (off_x)
+            *off_x = it->off_x;
+        if (off_y)
+            *off_y = it->off_y;
+    }
+    pthread_mutex_unlock(&ov_mu);
+    return popup;
+}
+
+static struct wl_webos_foreign *gl_foreign_get(void)
+{
+    if (!gl_foreign && host_foreign_name && g.registry)
+        gl_foreign = wl_registry_bind(g.registry, host_foreign_name, &wl_webos_foreign_interface,
+                                      1);
+    return gl_foreign;
+}
+
+static struct wl_compositor *gl_compositor_get(void)
+{
+    if (!gl_compositor && g.registry && host_compositor_name)
+        gl_compositor = wl_registry_bind(g.registry, host_compositor_name,
+                                         &wl_compositor_interface,
+                                         server_compositor_version &&
+                                                 server_compositor_version < 3
+                                             ? server_compositor_version : 3);
+    return gl_compositor;
+}
+
+static void gl_surface_destroyed(struct wl_proxy *surface)
+{
+    pthread_mutex_lock(&ov_mu);
+    if (surface == gl_window) {
+        if (gl_webos) {
+            wl_webos_shell_surface_destroy(gl_webos);
+            gl_webos = NULL;
+        }
+        gl_shell = NULL;
+        gl_window = NULL;
+        log_msg("GL window %p destroyed", (void *)surface);
+    }
+    if (surface == gl_main)
+        gl_main = NULL;
+    gl_pending_drop(surface);
+    pthread_mutex_unlock(&ov_mu);
 }
 
 static void ov_surface_destroyed(struct wl_proxy *surface)
@@ -2078,7 +2971,10 @@ static void ov_commit(struct wl_proxy *surface)
         consumed = 1;
     }
     b = ov_buf_find(it->current);
-    if (!consumed && flat_mode()) {
+    if (gl_mode() && surface == gl_main) {
+        /* GTK's window is hidden from the compositor and the GL window shows
+         * in its place. Its buffers only go back to the client. */
+    } else if (!consumed && flat_mode()) {
         /* No new buffer: the surface still shows the picture copied when its
          * buffer was attached. That buffer went back to the client right
          * after the copy (flat_releases), and the client may be drawing its
@@ -2172,12 +3068,31 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
         pthread_mutex_unlock(&ov_mu);
         return 0;
     }
+    /* Firefox marks the chrome's opaque parts as the window's opaque
+     * region. The compositor would then skip blending there and the video
+     * hole (alpha 0 pixels over the hardware plane) would come out black,
+     * so the GL window declares no opaque region at all. */
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_SET_OPAQUE_REGION && args[0].o &&
+        gl_mode() && proxy == gl_window) {
+        static int told;
+
+        if (!told++)
+            log_msg("GL window: opaque region dropped, the window stays blendable");
+        args[0].o = NULL;
+        return 0;
+    }
     /* Flat mode: the adapter answers frame callbacks itself (flat_sync_done);
      * the copied surfaces are never shown, and a webOS 6.5 TV answers not even
      * the window's. The window is made now if need be and a frame of it
      * committed, so the client's picture goes out before the answer. */
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_SET_INPUT_REGION && gl_mode() &&
+        gp_input_popup(proxy, NULL, NULL)) {
+        *out = NULL;    /* the window keeps its empty input region */
+        return 1;
+    }
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_FRAME && flat_mode() &&
-        proxy != (struct wl_proxy *)ov_surface) {
+        proxy != (struct wl_proxy *)ov_surface && !(gl_mode() && proxy == gl_window) &&
+        !(gl_mode() && gp_input_popup(proxy, NULL, NULL))) {
         created = new_virt(proxy, interface ? interface : &wl_callback_interface, 1, V_FRAME,
                            NULL);
         if (created) {
@@ -2194,7 +3109,13 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
         }
     }
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH) {
+        if (gl_mode())
+            gp_attach(proxy, (struct wl_proxy **)&args[0].o);
         ov_attach(proxy, (struct wl_proxy *)args[0].o);
+        if (gl_mode() && gl_window_commit(proxy, args[0].o != NULL)) {
+            *out = NULL;
+            return 1;
+        }
         if (flat_hidden(proxy)) {
             *out = NULL;
             return 1;
@@ -2208,6 +3129,10 @@ static int ov_intercept(struct wl_proxy *proxy, const char *name, uint32_t opcod
     } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_COMMIT) {
         layered_commit(proxy);
         ov_commit(proxy);
+        if (gl_mode() && gl_window_commit(proxy, -1)) {
+            *out = NULL;
+            return 1;
+        }
         if (flat_hidden(proxy)) {
             *out = NULL;
             return 1;
@@ -2239,6 +3164,7 @@ static struct wl_surface *ov_hit(int32_t x, int32_t y, int32_t *ox, int32_t *oy)
     int i;
 
     pthread_mutex_lock(&ov_mu);
+    hit = gp_hit(x, y, ox, oy);
     for (i = 0; i < OV_ITEMS; i++) {
         struct ov_item *it = &ov_items[i];
         int p = it->surface ? ov_popup_slot(it->popup) : -1;
@@ -2426,8 +3352,9 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
             place_popup(v, pos);
             v->abs_x += v->popup_x - old_x;
             v->abs_y += v->popup_y - old_y;
-            if (!v->subsurface && ov_is_popup(v->wl_surface))
+            if (!v->subsurface && ov_is_popup(v->wl_surface)) {
                 ov_popup_at(v->wl_surface, v->abs_x, v->abs_y);
+            }
             if (v->subsurface)
                 wl_subsurface_set_position(v->subsurface, v->popup_x, v->popup_y);
 
@@ -2438,6 +3365,10 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
     }
     if (v->kind == V_TOPLEVEL && opcode == XDG_TOPLEVEL_SET_TITLE && args && args[0].s) {
         int i;
+        log_msg("toplevel %p (surface %p) titled \"%s\"", (void *)v->proxy, (void *)v->wl_surface,
+                args[0].s);
+        if (gl_webos)
+            wl_webos_shell_surface_set_property(gl_webos, "title", args[0].s);
         for (i = 0; i < MAX_VIRT; i++) {
             if (g.virts[i].kind == V_SURFACE && g.virts[i].wl_surface == v->wl_surface &&
                 g.virts[i].webos_surface) {
@@ -2446,9 +3377,20 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
             }
         }
     }
-    if (v->kind == V_TOPLEVEL &&
-        (opcode == XDG_TOPLEVEL_SET_FULLSCREEN || opcode == XDG_TOPLEVEL_SET_MAXIMIZED))
-        emit_toplevel_configure(v);
+    if (v->kind == V_TOPLEVEL) {
+        switch (opcode) {
+        case XDG_TOPLEVEL_SET_FULLSCREEN:
+        case XDG_TOPLEVEL_UNSET_FULLSCREEN:
+            v->fullscreen = opcode == XDG_TOPLEVEL_SET_FULLSCREEN;
+            /* fallthrough */
+        case XDG_TOPLEVEL_SET_MAXIMIZED:
+        case XDG_TOPLEVEL_UNSET_MAXIMIZED:
+            emit_toplevel_configure(v);
+            break;
+        default:
+            break;
+        }
+    }
     if (opcode == 0 && v->proxy) {
         struct wl_proxy *dying = v->proxy;
 
@@ -2907,16 +3849,31 @@ static void text_model_send(int which, uint32_t arg)
         wl_proxy_marshal_flags(p, opcode, NULL, wl_proxy_get_version(p), 0);
 }
 
+/* The surface the compositor last gave the keyboard to, as it named it. */
+static struct wl_surface *keyboard_focus_raw;
+
 static void show_keyboard(void)
 {
+    struct wl_surface *target;
+
     ensure_text_model();
     if (!text_input || !our_seat || !main_surface)
         return;
+    /* The panel comes up only for the surface that has the keyboard. In GL
+     * mode that is the pop-up overlay once it has mapped, not the window. */
+    if (gl_mode() && keyboard_focus_raw &&
+        (keyboard_focus_raw == ov_surface || keyboard_focus_raw == (struct wl_surface *)gl_window))
+        target = keyboard_focus_raw;
+    else if (gl_mode() && gl_window)
+        target = (struct wl_surface *)gl_window;
+    else if (flat_mode() && ov_surface)
+        target = ov_surface;
+    else
+        target = main_surface;
     text_model_set_content_type(text_input, 0x100, 5);
     text_model_send(TM_ENTER_KEY_TYPE, 3);
     text_model_set_surrounding_text(text_input, "", 0, 0);
-    text_model_activate(text_input, ++g.serial, our_seat,
-                        flat_mode() && ov_surface ? ov_surface : main_surface);
+    text_model_activate(text_input, ++g.serial, our_seat, target);
     text_model_send(TM_SHOW_PANEL, 0);
     keyboard_up = 1;
     log_msg("keyboard shown");
@@ -3162,8 +4119,10 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
-    /* On the pop-up overlay: GTK is told about the pop-up under the pointer. */
-    ov_ptr_on = ov_surface && surface == ov_surface;
+    /* On the pop-up overlay or the GL window, GTK is told about the
+     * pop-up under the pointer. */
+    ov_ptr_on = (ov_surface && surface == ov_surface) ||
+                (gl_mode() && surface == (struct wl_surface *)gl_window);
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
         struct wl_surface *hit;
@@ -3188,9 +4147,23 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         if (hit && orig && orig->enter)
             orig->enter(data, pointer, serial, hit, x - wl_fixed_from_int(ox),
                         y - wl_fixed_from_int(oy));
+        else if (!hit && gl_mode() && main_surface && orig && orig->enter)
+            orig->enter(data, pointer, serial, main_surface, x, y);
         return;
     }
-    surface = input_surface(surface);
+    {
+        int32_t ox = 0, oy = 0;
+        struct wl_proxy *popup =
+            gl_mode() ? gp_input_popup((struct wl_proxy *)surface, &ox, &oy) : NULL;
+
+        if (popup) {
+            surface = (struct wl_surface *)popup;
+            x += wl_fixed_from_int(ox);
+            y += wl_fixed_from_int(oy);
+        } else {
+            surface = input_surface(surface);
+        }
+    }
     last_x = x >> 8;
     last_y = y >> 8;
     saw_motion = 1;
@@ -3207,14 +4180,22 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
-    if (ov_surface && surface == ov_surface) {
+    if ((ov_surface && surface == ov_surface) ||
+        (gl_mode() && surface == (struct wl_surface *)gl_window)) {
         if (ov_ptr_popup && orig && orig->leave)
             orig->leave(data, pointer, serial, ov_ptr_popup);
+        else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
+            orig->leave(data, pointer, serial, main_surface);
         ov_ptr_popup = NULL;
         ov_ptr_on = 0;
         return;
     }
-    surface = input_surface(surface);
+    {
+        struct wl_proxy *popup =
+            gl_mode() ? gp_input_popup((struct wl_proxy *)surface, NULL, NULL) : NULL;
+
+        surface = popup ? (struct wl_surface *)popup : input_surface(surface);
+    }
     if (synth_focus == surface)
         synth_focus = NULL;
     log_msg("POINTER leave surface=%p", (void *)surface);
@@ -3240,9 +4221,13 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
             log_msg("POINTER on pop-up %p at %d,%d", (void *)hit, last_x, last_y);
             if (ov_ptr_popup && orig && orig->leave)
                 orig->leave(data, pointer, ov_ptr_serial, ov_ptr_popup);
+            else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
+                orig->leave(data, pointer, ov_ptr_serial, main_surface);
             if (hit && orig && orig->enter)
                 orig->enter(data, pointer, ov_ptr_serial, hit, x - wl_fixed_from_int(ox),
                             y - wl_fixed_from_int(oy));
+            else if (!hit && gl_mode() && main_surface && orig && orig->enter)
+                orig->enter(data, pointer, ov_ptr_serial, main_surface, x, y);
             ov_ptr_popup = hit;
             ov_ptr_x = ox;
             ov_ptr_y = oy;
@@ -3250,6 +4235,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
         if (hit && orig && orig->motion)
             orig->motion(data, pointer, time, x - wl_fixed_from_int(ov_ptr_x),
                          y - wl_fixed_from_int(ov_ptr_y));
+        else if (!hit && gl_mode() && orig && orig->motion)
+            orig->motion(data, pointer, time, x, y);
         return;
     }
     if (orig && orig->motion)
@@ -3432,6 +4419,16 @@ static void apply_remote_event(struct ptr_ev ev)
         int lx = over ? ev.x - over->abs_x : ev.x;
         int ly = over ? ev.y - over->abs_y : ev.y;
 
+        if (!over && ov_enabled()) {
+            int32_t ox = 0, oy = 0;
+            struct wl_surface *hit = ov_hit(ev.x, ev.y, &ox, &oy);
+
+            if (hit) {
+                target = hit;
+                lx = ev.x - ox;
+                ly = ev.y - oy;
+            }
+        }
         focus_and_move(hook, target, lx, ly);
         if (ev.button < 0 || !keys->button)
             return;
@@ -3441,11 +4438,11 @@ static void apply_remote_event(struct ptr_ev ev)
         if (keys->frame)
             keys->frame(hook->data, (struct wl_pointer *)hook->proxy);
         log_msg("remote click %d at %d,%d%s", ev.down, ev.x, ev.y,
-                over ? " (in popup)" : "");
+                target != main_surface ? " (in popup)" : "");
         if (ev.down)
             note_click();
         /* A click inside a menu must not open or close the keyboard. */
-        if (!text_input_bound && ev.down && !over) {
+        if (!text_input_bound && ev.down && target == main_surface) {
             if (ev.y >= 30 && ev.y < 110 && ev.x < 1700)
                 show_keyboard();
             else
@@ -3701,6 +4698,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
     focused_keys = hook;
+    keyboard_focus_raw = surface;
     surface = input_surface(surface);
     log_msg("KEYBOARD enter surface=%p", (void *)surface);
     /* LSM treats a popup subsurface as separately focusable and hands it the
@@ -3727,6 +4725,8 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     struct hook *hook = hook_find(keyboard_hooks, keyboard);
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
+    if (keyboard_focus_raw == surface)
+        keyboard_focus_raw = NULL;
     surface = input_surface(surface);
     log_msg("KEYBOARD leave surface=%p", (void *)surface);
     if (is_popup_surface(surface)) {
@@ -4244,8 +5244,16 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
     if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_DESTROY) {
         int slot = layered_slot(proxy);
 
+        if (synth_focus == (struct wl_surface *)proxy)
+            synth_focus = NULL;
+        if (gl_mode() && gp_destroy(proxy)) {
+            *out = NULL;
+            return 1;
+        }
         if (slot >= 0)
             forget_slot(slot);
+        if (gl_mode())
+            gl_surface_destroyed(proxy);
         forget_shell_role(proxy);
         if (ov_enabled())
             ov_surface_destroyed(proxy);

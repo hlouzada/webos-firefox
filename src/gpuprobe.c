@@ -839,6 +839,180 @@ static int foreign_variants(void)
     return 0;
 }
 
+/* ---- A pop-up attached next to a video export on the same window ---- */
+
+struct cvariant {
+    const char *name;
+    uint32_t popup_type;   /* exported and imported type of the pop-up */
+    int video;             /* 0 none, 1 before the pop-up, 2 before with a region, 3 after */
+    int drop_video;        /* destroy the video export after 4 s */
+    uint32_t colour;
+};
+
+static const struct cvariant cvariants[] = {
+    { "no video export (control)", WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT, 0, 0,
+      0xffffffffu },
+    { "video export first, no region, destroyed after 4 s",
+      WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT, 1, 1, 0xffc02020u },
+    { "video export first with a region at 1000,500 800x450",
+      WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT, 2, 0, 0xff20a020u },
+    { "pop-up first, video export after it", WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_TRANSPARENT_OBJECT,
+      3, 0, 0xffd0a000u },
+    { "video export first, pop-up as opaque_object",
+      WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_OPAQUE_OBJECT, 1, 0, 0xffa020a0u },
+    { "video export first, pop-up as video_object",
+      WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT, 1, 0, 0xff00c0c0u },
+};
+
+static void id_into(void *d, struct wl_webos_exported *e, const char *id, uint32_t type)
+{
+    (void)e;
+    snprintf((char *)d, 128, "%s", id ? id : "");
+    say("  exported window id %s (type %u)", (char *)d, type);
+}
+
+static const struct wl_webos_exported_listener id_into_listener = { id_into };
+
+static int wait_id(const char *id)
+{
+    int i;
+
+    for (i = 0; i < 30 && !id[0]; i++) {
+        pump();
+        usleep(100000);
+    }
+    if (!id[0])
+        say("  no window id within 3 s");
+    return id[0] != '\0';
+}
+
+static struct wl_webos_exported *video_export(int with_region, char *id)
+{
+    struct wl_webos_exported *e;
+
+    id[0] = '\0';
+    e = wl_webos_foreign_export_element(w.foreign, w.main,
+                                        WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
+    wl_webos_exported_add_listener(e, &id_into_listener, id);
+    if (with_region) {
+        struct wl_region *r = wl_compositor_create_region(w.compositor);
+
+        wl_region_add(r, 1000, 500, 800, 450);
+        wl_webos_exported_set_exported_window(e, r, r);
+        wl_region_destroy(r);
+    }
+    wl_surface_commit(w.main);
+    wait_id(id);
+    return e;
+}
+
+static int coexist_variants(void)
+{
+    size_t v;
+
+    if (!make_window(1) || !bar_start())
+        return 1;
+    if (!w.foreign) {
+        say("  no wl_webos_foreign");
+        return 1;
+    }
+    bar_hold(1000);
+    /* With GPUPROBE_HOLE the window is transparent where the pop-up goes and
+     * only the first two variants run. That shows whether an imported
+     * surface lies beneath the window's own pixels. */
+    if (getenv("GPUPROBE_HOLE")) {
+        int x, y, i;
+
+        for (i = 0; i < 2; i++)
+            for (y = 200; y < 470; y++)
+                for (x = 300; x < 780; x++)
+                    bar_pix[i][(size_t)y * w.width + x] = 0;
+        wl_surface_attach(w.main, bar_bufs[bar_cur], 0, 0);
+        wl_surface_damage(w.main, 0, 0, w.width, w.height);
+        wl_surface_commit(w.main);
+        say("  the window has an alpha 0 hole at 300,200 480x270");
+        bar_hold(1000);
+    }
+    for (v = 0; v < sizeof cvariants / sizeof cvariants[0]; v++) {
+        const struct cvariant *var = &cvariants[v];
+
+        if (getenv("GPUPROBE_HOLE") && v >= 2)
+            break;
+        struct wl_webos_exported *video = NULL, *exported;
+        struct wl_webos_imported *imported;
+        struct wl_region *region;
+        struct wl_surface *s;
+        struct wl_buffer *b;
+        uint32_t *p;
+        char vid[128], pid[128], tag[80];
+        int pw = 480, ph = 270;
+
+        snprintf(tag, sizeof tag, "coexist %zu", v + 1);
+        step(tag);
+        say("  %s: %s; pop-up of colour 0x%06x at 300,200 %dx%d", tag, var->name,
+            var->colour & 0xffffffu, pw, ph);
+        if (var->video == 1 || var->video == 2)
+            video = video_export(var->video == 2, vid);
+        pid[0] = '\0';
+        exported = wl_webos_foreign_export_element(w.foreign, w.main, var->popup_type);
+        wl_webos_exported_add_listener(exported, &id_into_listener, pid);
+        region = wl_compositor_create_region(w.compositor);
+        wl_region_add(region, 300, 200, pw, ph);
+        wl_webos_exported_set_exported_window(exported, region, region);
+        wl_region_destroy(region);
+        wl_surface_commit(w.main);
+        if (!wait_id(pid)) {
+            wl_webos_exported_destroy(exported);
+            if (video)
+                wl_webos_exported_destroy(video);
+            continue;
+        }
+        if (var->video == 3)
+            video = video_export(0, vid);
+        s = wl_compositor_create_surface(w.compositor);
+        w.test = s;
+        wl_surface_add_listener(s, &surface_listener, (void *)tag);
+        b = solid_buffer(pw, ph, var->colour, &p);
+        if (!b)
+            return 1;
+        wl_surface_attach(s, b, 0, 0);
+        wl_surface_damage(s, 0, 0, pw, ph);
+        wl_surface_commit(s);
+        imported = wl_webos_foreign_import_element(w.foreign, pid, var->popup_type);
+        wl_webos_imported_add_listener(imported, &imported_listener, NULL);
+        wl_webos_imported_attach_surface(imported, s);
+        wl_surface_commit(s);
+        wl_display_flush(w.display);
+        if (var->drop_video && video) {
+            bar_hold(4000);
+            wl_webos_exported_destroy(video);
+            video = NULL;
+            wl_surface_commit(w.main);
+            wl_display_flush(w.display);
+            say("  %s: video export destroyed, pop-up kept", tag);
+            bar_hold(4000);
+        } else {
+            bar_hold(7000);
+        }
+        say("  %s done: window frame callbacks so far %d", tag, w.frames_done);
+        wl_webos_imported_detach_surface(imported, s);
+        wl_webos_imported_destroy(imported);
+        wl_webos_exported_destroy(exported);
+        if (video)
+            wl_webos_exported_destroy(video);
+        wl_surface_attach(s, NULL, 0, 0);
+        wl_surface_commit(s);
+        wl_surface_destroy(s);
+        w.test = NULL;
+        wl_buffer_destroy(b);
+        munmap(p, (size_t)pw * (size_t)ph * 4);
+        bar_hold(1000);
+    }
+    alarm(0);
+    say("  all coexist variants shown");
+    return 0;
+}
+
 /* ---- A full-screen transparent overlay with an opaque box, by window type ---- */
 
 static const struct variant overlays[] = {
@@ -907,6 +1081,156 @@ static int overlay_variants(void)
     }
     alarm(0);
     say("  all overlay variants shown");
+    return 0;
+}
+
+/* ---- OVERLAY and FLOATING surfaces over the window, full-screen and pop-up sized ---- */
+
+struct ovariant {
+    const char *name;
+    const char *type;
+    int full;          /* 1 full-screen transparent with a box at 300,200, 0 a 480x270 box */
+    uint32_t colour;
+};
+
+static const struct ovariant ovariants[] = {
+    { "full-screen OVERLAY", "_WEBOS_WINDOW_TYPE_OVERLAY", 1, 0xff20a020u },
+    { "full-screen FLOATING", "_WEBOS_WINDOW_TYPE_FLOATING", 1, 0xffd0a000u },
+    { "480x270 OVERLAY", "_WEBOS_WINDOW_TYPE_OVERLAY", 0, 0xff00c0c0u },
+    { "480x270 FLOATING", "_WEBOS_WINDOW_TYPE_FLOATING", 0, 0xffffffffu },
+};
+
+static int overlay2_variants(void)
+{
+    size_t v;
+
+    if (!make_window(1) || !bar_start())
+        return 1;
+    bar_hold(1000);
+    for (v = 0; v < sizeof ovariants / sizeof ovariants[0]; v++) {
+        const struct ovariant *var = &ovariants[v];
+        struct wl_surface *s;
+        struct wl_shell_surface *ss;
+        struct wl_webos_shell_surface *ws;
+        struct wl_buffer *b;
+        uint32_t *p;
+        int bw = var->full ? w.width : 480, bh = var->full ? w.height : 270;
+        int x, y;
+        char tag[80];
+
+        /* GPUPROBE_ONLY=n runs one variant on a fresh window. */
+        if (getenv("GPUPROBE_ONLY") && (size_t)atoi(getenv("GPUPROBE_ONLY")) != v + 1)
+            continue;
+        snprintf(tag, sizeof tag, "overlay2 %zu", v + 1);
+        step(tag);
+        say("  %s: %s, colour 0x%06x", tag, var->name, var->colour & 0xffffffu);
+        s = wl_compositor_create_surface(w.compositor);
+        w.test = s;
+        wl_surface_add_listener(s, &surface_listener, (void *)tag);
+        ss = wl_shell_get_shell_surface(w.shell, s);
+        wl_shell_surface_add_listener(ss, &shell_listener, (void *)tag);
+        wl_shell_surface_set_toplevel(ss);
+        ws = wl_webos_shell_get_shell_surface(w.webos_shell, s);
+        wl_webos_shell_surface_add_listener(ws, &webos_listener, (void *)tag);
+        wl_webos_shell_surface_set_property(ws, "appId", app_id());
+        wl_webos_shell_surface_set_property(ws, "displayAffinity", "0");
+        wl_webos_shell_surface_set_property(ws, "_WEBOS_WINDOW_TYPE", var->type);
+        b = solid_buffer(bw, bh, 0x00000000u, &p);
+        if (!b)
+            return 1;
+        for (y = 0; y < bh; y++)
+            for (x = 0; x < bw; x++) {
+                int bx = var->full ? x - 300 : x, by = var->full ? y - 200 : y;
+                int in = bx >= 0 && bx < 480 && by >= 0 && by < 270;
+                int edge = in && (bx < 8 || by < 8 || bx >= 472 || by >= 262);
+
+                p[(size_t)y * bw + x] = edge ? 0xff000000u : in ? var->colour : 0;
+            }
+        wl_surface_attach(s, b, 0, 0);
+        wl_surface_damage(s, 0, 0, bw, bh);
+        wl_surface_commit(s);
+        wl_display_flush(w.display);
+        bar_hold(7000);
+        say("  %s done: window frame callbacks so far %d", tag, w.frames_done);
+        wl_surface_attach(s, NULL, 0, 0);
+        wl_surface_commit(s);
+        wl_webos_shell_surface_destroy(ws);
+        wl_shell_surface_destroy(ss);
+        wl_surface_destroy(s);
+        w.test = NULL;
+        wl_buffer_destroy(b);
+        munmap(p, (size_t)bw * (size_t)bh * 4);
+        bar_hold(3000);
+        say("  %s: window still drawing? frame callbacks now %d", tag, w.frames_done);
+    }
+    alarm(0);
+    say("  all overlay2 variants shown");
+    return 0;
+}
+
+/* ---- Pointer routing with a full-screen OVERLAY kept over the window ---- */
+
+static int input_variants(void)
+{
+    struct wl_surface *s;
+    struct wl_shell_surface *ss;
+    struct wl_webos_shell_surface *ws;
+    struct wl_buffer *b;
+    struct wl_region *r;
+    uint32_t *p;
+    int x, y;
+
+    if (!make_window(1) || !bar_start())
+        return 1;
+    bar_hold(1000);
+    step("input 1");
+    say("  input 1: full-screen transparent OVERLAY, green box at 300,200, input region = the box, 25 s");
+    s = wl_compositor_create_surface(w.compositor);
+    w.test = s;
+    wl_surface_add_listener(s, &surface_listener, (void *)"overlay");
+    ss = wl_shell_get_shell_surface(w.shell, s);
+    wl_shell_surface_add_listener(ss, &shell_listener, (void *)"overlay");
+    wl_shell_surface_set_toplevel(ss);
+    ws = wl_webos_shell_get_shell_surface(w.webos_shell, s);
+    wl_webos_shell_surface_add_listener(ws, &webos_listener, (void *)"overlay");
+    wl_webos_shell_surface_set_property(ws, "appId", app_id());
+    wl_webos_shell_surface_set_property(ws, "displayAffinity", "0");
+    wl_webos_shell_surface_set_property(ws, "_WEBOS_WINDOW_TYPE", "_WEBOS_WINDOW_TYPE_OVERLAY");
+    b = solid_buffer(w.width, w.height, 0x00000000u, &p);
+    if (!b)
+        return 1;
+    for (y = 200; y < 470; y++)
+        for (x = 300; x < 780; x++) {
+            int edge = x < 308 || y < 208 || x >= 772 || y >= 462;
+
+            p[(size_t)y * w.width + x] = edge ? 0xff000000u : 0xff20a020u;
+        }
+    r = wl_compositor_create_region(w.compositor);
+    wl_region_add(r, 300, 200, 480, 270);
+    wl_surface_set_input_region(s, r);
+    wl_region_destroy(r);
+    wl_surface_attach(s, b, 0, 0);
+    wl_surface_damage(s, 0, 0, w.width, w.height);
+    wl_surface_commit(s);
+    wl_display_flush(w.display);
+    bar_hold(25000);
+    step("input 2");
+    say("  input 2: same overlay, input region = the whole screen, 15 s");
+    wl_surface_set_input_region(s, NULL);
+    wl_surface_commit(s);
+    wl_display_flush(w.display);
+    bar_hold(15000);
+    say("  input done: window frame callbacks so far %d", w.frames_done);
+    wl_surface_attach(s, NULL, 0, 0);
+    wl_surface_commit(s);
+    wl_webos_shell_surface_destroy(ws);
+    wl_shell_surface_destroy(ss);
+    wl_surface_destroy(s);
+    w.test = NULL;
+    wl_buffer_destroy(b);
+    munmap(p, (size_t)w.width * (size_t)w.height * 4);
+    bar_hold(2000);
+    alarm(0);
     return 0;
 }
 
@@ -1068,6 +1392,24 @@ static int overlay_child(int unused)
     return overlay_variants();
 }
 
+static int coexist_child(int unused)
+{
+    (void)unused;
+    return coexist_variants();
+}
+
+static int overlay2_child(int unused)
+{
+    (void)unused;
+    return overlay2_variants();
+}
+
+static int input_child(int unused)
+{
+    (void)unused;
+    return input_variants();
+}
+
 static const char *verdict(int r)
 {
     return r == 0 ? "works" : r == 3 ? "hangs" : r == 4 ? "crashes" : "fails";
@@ -1104,6 +1446,12 @@ int main(void)
         return child("a surface attached into an exported region of the window", foreign_child, 0);
     if (getenv("GPUPROBE_OVERLAY"))
         return child("a full-screen transparent overlay by window type", overlay_child, 0);
+    if (getenv("GPUPROBE_INPUT"))
+        return child("pointer routing with an OVERLAY kept over the window", input_child, 0);
+    if (getenv("GPUPROBE_OVERLAY2"))
+        return child("OVERLAY and FLOATING surfaces over the window", overlay2_child, 0);
+    if (getenv("GPUPROBE_COEXIST"))
+        return child("a pop-up attached next to a video export of the window", coexist_child, 0);
     if (!getenv("GPUPROBE_SKIP_POPUPS"))
         c = child("a second surface under each webOS window type", popup_child, 0);
     say("");

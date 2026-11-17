@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -313,14 +314,35 @@ int main(int argc, char **argv)
     /* The runtime's own libraries come first; its copy of libwayland-client
      * carries the webOS shell adapter. Everything else is the TV's. */
     snprintf(libpath, sizeof libpath, "%s/firefox-runtime", dir);
-    /* GTK needs libwayland-egl.so.1 to load. Newer webOS has it, matched to
-     * its Mali driver, and must keep using its own; webOS 4 has none, so
-     * then use the generic one bundled in firefox-runtime/fallback. */
+    /* GTK needs libwayland-egl.so.1 to load, and the Mali driver only draws
+     * into windows made by the library it was built with. Newer webOS has
+     * it under that name. webOS 6.5 ships it as libwayland-egl.so.0 only, so
+     * a link under the name GTK asks for goes first in the library path.
+     * glibc maps the file once, so Mali and GTK share it. webOS 4 has none
+     * and gets the generic one bundled in firefox-runtime/fallback. */
     if (access("/usr/lib/libwayland-egl.so.1", F_OK) != 0 &&
         access("/lib/libwayland-egl.so.1", F_OK) != 0) {
         size_t len = strlen(libpath);
-        snprintf(libpath + len, sizeof libpath - len, ":%s/firefox-runtime/fallback", dir);
-        fprintf(stderr, "geckotv: no libwayland-egl.so.1 on this TV, using the bundled one\n");
+        const char *tv = access("/usr/lib/libwayland-egl.so.0", F_OK) == 0
+                             ? "/usr/lib/libwayland-egl.so.0"
+                             : access("/lib/libwayland-egl.so.0", F_OK) == 0
+                                   ? "/lib/libwayland-egl.so.0" : NULL;
+        char linkdir[PATH_MAX];
+        char link[PATH_MAX];
+
+        snprintf(linkdir, sizeof linkdir, "%s/.wayland-egl", home);
+        snprintf(link, sizeof link, "%s/libwayland-egl.so.1", linkdir);
+        if (tv && len + strlen(linkdir) + 2 < sizeof libpath &&
+            (mkdir(linkdir, 0755) == 0 || errno == EEXIST) &&
+            (unlink(link) == 0 || errno == ENOENT) && symlink(tv, link) == 0) {
+            memmove(libpath + strlen(linkdir) + 1, libpath, len + 1);
+            memcpy(libpath, linkdir, strlen(linkdir));
+            libpath[strlen(linkdir)] = ':';
+            fprintf(stderr, "geckotv: libwayland-egl.so.1 is the TV's %s\n", tv);
+        } else {
+            snprintf(libpath + len, sizeof libpath - len, ":%s/firefox-runtime/fallback", dir);
+            fprintf(stderr, "geckotv: no libwayland-egl.so.1 on this TV, using the bundled one\n");
+        }
     }
     /* The runtime's GTK finds its image decoders through this cache. */
     snprintf(marker, sizeof marker, "%s/firefox-runtime/gdk-pixbuf/loaders.cache", dir);

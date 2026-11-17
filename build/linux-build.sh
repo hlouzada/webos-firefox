@@ -35,7 +35,7 @@ if [[ "${1:-}" != "--as-user" ]]; then
         echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" \
             > /etc/apt/sources.list.d/llvm-19.list
         apt-get update
-        apt-get install -y --no-install-recommends clang-19 lld-19 libclang-19-dev
+        apt-get install -y --no-install-recommends clang-19 lld-19 llvm-19 libclang-19-dev
     fi
     if [[ ! -f $WORK/sysroot-armel/lib/arm-linux-gnueabi/libc.so.6 ]]; then
         phase "armel sysroot"

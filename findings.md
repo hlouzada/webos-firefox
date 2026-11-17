@@ -1620,3 +1620,163 @@ packages. Truncate `geckotv.log` and delete `env` right after a logged run.
   addresses here instead of `library+offset`, so `build/symbolize-arm32.py`
   has nothing to resolve yet, and `libxul` from `mach package` has no
   symbols anyway.
+
+---
+
+## 23. Why pages felt slow on webOS 6.5, and what was cut (2026-11-17)
+
+Measured on the webOS 6.5 TV (`findings.md` section 19's device) with the
+0.1.46 runtime, before any change in this round.
+
+**The network is not the problem.** From the TV's own shell, `curl` fetches
+Wikipedia's main page in 0.22 s and YouTube's front page in 0.36 s. DNS
+answers at once and Wi-Fi sits at -57 dBm on 5 GHz.
+
+**The system starts out short of memory.** With Firefox closed, webOS itself
+holds 336 MB of the 600 MB flash swap (`/dev/mapper/eswap`) with
+`vm.swappiness` 100, and 864 MB is available. The zram device exists but is
+not set up (`disksize` 0), so `scripts/tv-zram.sh` was never installed on
+this TV. Opening one Wikipedia article gave these numbers.
+
+| Time after launch | Firefox PSS | Available | Swap used | Major faults | Firefox CPU |
+|---|---|---|---|---|---|
+| 5 s | 180 MB | 734 MB | 336 MB | 95 | |
+| 10 s | 292 MB | 557 MB | 335 MB | 133 | |
+| 15 s | 387 MB | 459 MB | 373 MB | 1287 | 27 s (180% of a core) |
+
+The page title reached the window 16 to 17 s after launch. kswapd0 and LG's
+memory manager (memchute) were both among the busiest processes during
+those seconds, and 1.36 million pages had been swapped in since boot (17 h).
+The load average of 34 is not load, because it counts the SoC driver
+threads parked in D state (VDEC, DMS, HDCP). The LG service `ss.gateway`
+uses 25 to 28% of a core all the time. CMA had 30 MB of 200 MB free before
+Firefox started, and Mali's 1080p buffers come from there.
+
+**The build was sound.** `JS_CODEGEN_ARM` (the JIT) is compiled in, `-O2`,
+release, no LTO, no PGO. The window title says "Nightly" because the build
+uses `browser/branding/unofficial`. That is cosmetic.
+
+**What Firefox did at every start.** `prefs.js` showed 40 remote-settings
+collections polled, Safe Browsing list updates, Normandy, and the log a
+sponsored top-sites fetch (`TopSitesFeed: Failed to fetch data from MARS
+server`). The profile held 23 MB of CRLite data and 21 MB of startup cache.
+`app/defaults/pref/00-webos.js` now turns these off in its "Background
+services" block, and remote settings keeps a weekly poll for the
+certificate blocklist. This was verified without taking the screen. Firefox
+ran headless as the app's user for 90 s on the same article with
+`MOZ_LOG=nsHttp:3`, and the table lists the hosts contacted.
+
+| Host | Old prefs | New prefs |
+|---|---|---|
+| en.wikipedia.org, upload/thumb.wikimedia.org | 63 requests | 65 |
+| detectportal.firefox.com | 6 | 0 |
+| push.services.mozilla.com | 1 | 0 |
+| location.services.mozilla.com | 1 | 0 |
+| ads.mozilla.org | 1 | 0 |
+| firefox.settings.services.mozilla.com | 1 | 1 |
+| content-signature-2.cdn.mozilla.net | 5 | 5 |
+
+The last two are the signature checks on collections loaded from the
+bundled dumps. `RemoteSettingsClient.get()` performs them whatever the poll
+interval. Nimbus still reads `nimbus-secure-experiments` with studies off,
+and that is by design.
+
+Headless start-up of the 0.1.46 runtime over three runs in a 40 s window
+took 45 s of CPU and 354 MB PSS, with the first request to the page at
++8.4 s and the last at +13.5 s. Headless means software WebRender, so the
+rendering cost is not the GPU path's. The 8 s before the first request are
+Firefox starting before the page is involved.
+
+**Launcher traps met on the way.** Running `geckotv` from a root shell
+always picks `<app>/profile`, and Firefox refuses a profile owned by uid
+6808. busybox 1.29 here has no `su` by uid and its `setpriv` lacks
+`--reuid`, so a 12-line static `setuid` wrapper did it. `pkill -f
+firefox-runtime/firefox` from ssh kills the shell whose script text holds
+that string, so match on `/proc/*/exe` instead. Two visible launches of the
+0.1.46 runtime ended on their own 25 and 50 s after the window appeared
+with nothing in Firefox's log before the card went invisible. The home
+screen that followed (`SAM ... caller_app_id last_input_handler`) is what
+webOS launches after any foreground app exits, so it says nothing about the
+cause. The cause stays open. A third visible launch of the new runtime with
+the new prefs ran until it was closed 30 s after the page title.
+
+**Firefox was one launch away from the Safe Mode prompt.** `prefs.js` held
+`toolkit.startup.recent_crashes` at 10. Every SIGTERM from the app manager
+early in a start and every `kill -9` from a shell counts as a start-up
+crash, and at three Firefox stops at a prompt a remote cannot answer. In a
+headless run it sat idle after two requests, and that is how it was
+noticed. The counter was reset and `toolkit.startup.max_resumed_crashes`
+is now -1.
+
+**Build-side removals.** `build/mozconfig-nc4` now builds with ThinLTO
+through lld and without the Wi-Fi scanner, GSS-API authentication and JPEG
+XL. Three things did not work out. `--disable-dbus` makes
+`toolkit/components/remote` compile the X11 remote server, and a
+Wayland-only build cannot compile it. Sync, Normandy, Health Report and the
+devtools client are forced by `imply_option` in `browser/moz.configure`,
+and Normandy's directory is built for the browser app regardless, so they
+stay and are turned off by prefs. The container's default `llvm-ar` is LLVM
+18 and refuses clang 19's bitcode, so `AR` points at LLVM 19's.
+
+**ThinLTO changes nothing measurable at start-up.** The new runtime
+(0.1.47) and the old one were run headless alternately, three times each,
+in the same memory state of about 380 MB of swap in use. The table has the
+numbers.
+
+| 40 s headless window | 0.1.46 | 0.1.47 (ThinLTO) |
+|---|---|---|
+| Firefox CPU | 49.0, 49.9, 49.1 s | 49.1, 49.1, 48.6 s |
+| PSS at 40 s | 362 to 378 MB | 373 to 375 MB |
+| First request to the page | +9.5 to +10.8 s | +9.4 to +11.4 s |
+
+`libxul.so` is the same size (124.5 MiB) and the package the same 70 MB.
+The visible launch of 0.1.47 used GPU rendering in GL window mode with
+hardware video on and showed the page at 2802 CPU ticks 15 s in, where
+the two 0.1.46 launches had 2696 and 3364. What did move the numbers was
+swap. The same 0.1.46 runtime took 45 s of CPU in the 40 s window at
+336 MB of swap and 49 s at 380 MB. That is a day's difference in system
+state and a direct argument for `scripts/tv-zram.sh`.
+
+**One pref was wrong.** Emptying `captivedetect.canonicalURL` makes the
+detector throw `No canonical URL set up` on every start. The service is
+off by its own pref, so the line went. The remaining console errors
+(`BackupService` `PathUtils.join`, `SearchSERPTelemetry`
+`_searchProviderInfo is null`, `AboutHomeStartupCache`) appear with the old
+prefs and the old runtime too.
+
+**Betterfox.** `00-webos.js` ends with the Betterfox `user.js` (version
+154, 115 prefs) reduced to 70. 25 were already set above, and two of those
+keep the lower-memory value set here. Two have no pref in this ESR 153 tree
+and one is Windows-only. 17 would spend more RAM, flash or CPU than the
+current settings. Those are the font, canvas, media, network buffer and
+connection limits, the hour-long media read-ahead, downloads into the
+RAM-backed /tmp, the disk cache off, and a few more, and the file's comment
+lists them. With the block in place a headless run loaded the article with
+73 requests as before and no new console error, and a visible launch
+rendered it on the GPU path 9 s after the window appeared. Two of the kept
+prefs change behaviour rather than cost. One is HTTPS-only mode. The other
+is OCSP off, and together with CRLite off above that leaves no certificate
+revocation check.
+
+**What still recorded with uploads off.** These are now also disabled by
+prefs. They are the page-interaction rows in `places.sqlite`, the
+blocked-tracker database and its milestone prompt, search-page
+classification (the source of the `SearchSERPTelemetry` console error),
+the captcha-detection actor, the Reporting API and Glean's start at
+shutdown. Glean itself still initialises at start. With uploads off it
+records nothing and has no pref to skip it.
+
+**Logging is a build-time level.** One launch wrote 855 lines (48 KB) to
+`geckotv.log`, made of 478 adapter `listener wl_callback` lines, 255 other
+adapter lines, 61 graphics annotations, 33 keymap errors and 8 Firefox
+console lines. The console lines come from `browser.dom.window.dump.enabled`
+and `devtools.console.stdout.chrome`, and both default to true in an
+unofficial build. `LOGLEVEL` (Makefile and `build/build-adapter.sh`,
+default 0) now compiles the adapter's per-event lines out and makes the
+launcher write those two prefs and `layout.css.report_errors` false into
+`user.js` at each start through the same marked-block mechanism as the
+renderer pref. The same launch at level 0 wrote 243 lines (19 KB) with no
+console lines and no callback trace. What remains is the compositor
+inventory printed once per Firefox process (six or seven times), the
+graphics annotations that Firefox writes to stderr regardless of prefs, and
+xkbcommon's keymap errors. The log file itself still grows without bound.

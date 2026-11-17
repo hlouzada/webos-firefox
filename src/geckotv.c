@@ -185,24 +185,35 @@ static int flat_mode_compositor(void)
     return result;
 }
 
-/* Firefox's WebRender on the GPU or in software, written to the profile's
- * user.js, which Firefox applies at every start. In flat mode (webOS 5 and
- * 6) the adapter composes Firefox's surfaces into one window from their
- * shared-memory buffers, and the GPU path never gets a frame out: a webOS 6.5
- * TV's Mali driver waits forever at the first swap (black screen; GPU probe
- * "hangs"). Software rendering there; Firefox's default everywhere else.
- * The line is rewritten each start, false as well as true: Firefox keeps a
- * user.js value in prefs.js, so dropping the line would leave it set. */
-#define SOFTWARE_PREF_MARK "// geckotv: WebRender on the GPU or in software, set at each start"
+/* Prefs the launcher decides at each start. They go into the profile's
+ * user.js and Firefox applies that file at every start.
+ *  - WebRender on the GPU or in software. In flat mode (webOS 5 and 6) the
+ *    adapter composes Firefox's surfaces into one window from their
+ *    shared-memory buffers and the GPU path never gets a frame out. A
+ *    webOS 6.5 TV's Mali driver waits forever at the first swap with a
+ *    black screen and the GPU probe hangs. Software rendering there and
+ *    Firefox's default everywhere else.
+ *  - Console output into geckotv.log. This unofficial build dumps every
+ *    chrome console message and CSS parse error to stderr by default.
+ *    The build's GECKOTV_LOGLEVEL (LOGLEVEL in the Makefile) decides.
+ * Every line is rewritten each start and a false value is written out like
+ * a true one. Firefox keeps a user.js value in prefs.js, so dropping a line
+ * would leave it set. The marker lines start with "// geckotv:" and the
+ * user_pref lines that follow one are replaced as a block. */
+#ifndef GECKOTV_LOGLEVEL
+#define GECKOTV_LOGLEVEL 0
+#endif
+#define GECKOTV_MARK "// geckotv:"
 
-static void set_software_rendering(const char *profile, int on)
+static void write_launcher_prefs(const char *profile, int software)
 {
     char path[PATH_MAX];
     char tmp[PATH_MAX];
     char line[1024];
     FILE *in;
     FILE *out;
-    int skip_next = 0;
+    int in_block = 0;
+    const char *console = GECKOTV_LOGLEVEL >= 1 ? "true" : "false";
 
     snprintf(path, sizeof path, "%s/user.js", profile);
     snprintf(tmp, sizeof tmp, "%s/user.js.geckotv-new", profile);
@@ -212,20 +223,27 @@ static void set_software_rendering(const char *profile, int on)
     in = fopen(path, "r");
     if (in) {
         while (fgets(line, sizeof line, in)) {
-            if (skip_next) {
-                skip_next = 0;
+            if (strncmp(line, GECKOTV_MARK, strlen(GECKOTV_MARK)) == 0) {
+                in_block = 1;
                 continue;
             }
-            if (strncmp(line, SOFTWARE_PREF_MARK, strlen(SOFTWARE_PREF_MARK)) == 0) {
-                skip_next = 1;
+            if (in_block && strncmp(line, "user_pref(", 10) == 0)
                 continue;
-            }
+            in_block = 0;
             fputs(line, out);
         }
         fclose(in);
     }
-    fprintf(out, "%s\nuser_pref(\"gfx.webrender.software\", %s);\n", SOFTWARE_PREF_MARK,
-            on ? "true" : "false");
+    fprintf(out,
+            "%s WebRender on the GPU or in software, set at each start\n"
+            "user_pref(\"gfx.webrender.software\", %s);\n",
+            GECKOTV_MARK, software ? "true" : "false");
+    fprintf(out,
+            "%s console output into geckotv.log, from the build's log level\n"
+            "user_pref(\"browser.dom.window.dump.enabled\", %s);\n"
+            "user_pref(\"devtools.console.stdout.chrome\", %s);\n"
+            "user_pref(\"layout.css.report_errors\", %s);\n",
+            GECKOTV_MARK, console, console, console);
     if (fclose(out) == 0)
         rename(tmp, path);
     else
@@ -461,7 +479,7 @@ int main(int argc, char **argv)
     }
     setenv("APPID", "com.github.gprot42.geckotv", 0);
 
-    /* GPU or software WebRender for this compositor (set_software_rendering).
+    /* GPU or software WebRender for this compositor (write_launcher_prefs).
      * GECKOTV_SOFTWARE=0|1 in <app dir>/env overrides the choice. */
     {
         const char *forced = getenv("GECKOTV_SOFTWARE");
@@ -490,7 +508,7 @@ int main(int argc, char **argv)
             unsetenv("WEBOS_XDG_GL");
         }
         if (flat >= 0 || (forced && forced[0])) {
-            set_software_rendering(home, software);
+            write_launcher_prefs(home, software);
             fprintf(stderr, "geckotv: %s rendering (%s)%s\n", software ? "software" : "GPU",
                     forced && forced[0] ? "GECKOTV_SOFTWARE"
                     : flat != 1         ? "compositor has wl_subcompositor or no wl_webos_foreign"

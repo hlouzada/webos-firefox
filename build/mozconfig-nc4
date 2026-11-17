@@ -39,6 +39,20 @@ ac_add_options --enable-install-strip
 # Playback through LG's media pipeline (dom/media/platforms/webos).
 ac_add_options --enable-webos-media-engine
 
+# ThinLTO through lld across the C++. Rust keeps its own codegen because
+# rustc's LLVM 20 and clang 19 cannot share bitcode.
+ac_add_options --enable-linker=lld
+ac_add_options --enable-lto=thin
+# ThinLTO objects are LLVM 19 bitcode. The container's default llvm-ar is
+# LLVM 18 and refuses them, so the archiver must come from the same LLVM.
+export AR=/usr/lib/llvm-19/bin/llvm-ar
+# No Wi-Fi geolocation scan to run, no Kerberos, and JPEG XL is off at run
+# time anyway. D-Bus stays because without it the remote service falls back
+# to its X11 form and a Wayland-only build cannot compile that.
+ac_add_options --disable-necko-wifi
+ac_add_options --disable-negotiateauth
+ac_add_options --disable-jxl
+
 # clang takes its C++ headers and libstdc++ from the SDK's GCC 16. That
 # libstdc++ is built for ARMv7 against glibc 2.12, so it needs no __sync
 # helpers and no newer glibc symbols; it is linked statically with its

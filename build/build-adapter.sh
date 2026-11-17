@@ -40,7 +40,9 @@ wayland-scanner client-header "$ROOT/src/webos-foreign.xml" \
     "$GEN/webos-foreign-client-protocol.h"
 wayland-scanner private-code "$ROOT/src/webos-foreign.xml" \
     "$GEN/webos-foreign-protocol.c"
-cp "$ROOT/src/webos-xdg.c" "$GEN/webos-xdg.c"
+# LOGLEVEL=1 keeps the adapter's per-event trace described in the README.
+# 0 is the release level.
+{ echo "#define GECKOTV_LOGLEVEL ${LOGLEVEL:-0}"; cat "$ROOT/src/webos-xdg.c"; } > "$GEN/webos-xdg.c"
 python3 - <<'PY'
 from pathlib import Path
 p = Path("/tmp/wayland-1.22.0/src/wayland-client.c")

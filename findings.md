@@ -577,9 +577,7 @@ display, config, context and surface calls with attributes and errors.
 Firefox opens `libEGL.so` before `libEGL.so.1`, so the tracer needs both
 names.
 
-**Not started:** hardware video decoding through LG's media stack, which
-needs a custom Firefox decoder module and handling for video shown on a
-separate display plane.
+**Hardware video decoding** through LG's media stack is section 21.
 
 ---
 
@@ -1166,3 +1164,265 @@ jemalloc_stats_lite. It now prints the offset from the file's first mapping.
 The unstripped binaries are in /work/obj-nc4/dist/bin (the shipped nc4
 build; obj-nc4-gcc is the failed GCC experiment), and
 /work/nc4/out/build/*/ has the unstripped GTK stack.
+
+---
+
+## 21. Hardware video decoding through LG's media stack
+
+### The media server decodes for us (2026-11-16)
+
+`experiments/luna-media/media-test.sh` was run as root on a webOS 6.5.3-47
+TV. It loads a public 1080p60 H.264 clip through
+`luna://com.webos.media/load`, plays it for 15 s and records the service's
+events. One round ran as root and one with
+`luna-send -a com.github.gprot42.geckotv`, and both behaved the same.
+
+- `resourceInfo` listed `{"type":"VDEC","portNumber":2}` and `videoInfo`
+  reported `vdec_ch: 2`, 1920x1080 and 60 fps, so the pipeline assigned a
+  hardware decoder channel to the clip.
+- `loadCompleted` and `playing` arrived, and `currentTime` advanced about
+  200 ms every 200 ms with no stall. Nothing of this ran in our process.
+- The clip has no audio track (`numAudioTracks: 0`), so there was nothing to
+  hear. No window id was passed, so whether a picture appeared is not
+  recorded. Without one the decoded frames have no video plane.
+
+So LG's pipeline will decode H.264 at 1080p60 for this app id with no
+permission change. 4K and HEVC are untested but take the same path.
+
+### How a native app gets elementary streams into that pipeline
+
+The URL player above is not what a browser needs, because Firefox demuxes
+itself and has compressed frames to hand over. LG's API for that is
+**NDL_DirectMedia v2** in `libNDL_directmedia.so.1` on webOS 5 and later.
+The header travels with LG's native SDK and with homebrew projects such as
+moonlight-tv. What follows is known about it from those projects' notes and
+from the TV.
+
+- `NDL_DirectMediaInit(appId)`, `NDL_DirectMediaSetWindowId(id)`,
+  `NDL_DirectMediaLoad(&info, callback)` with the codec and size, then
+  `NDL_DirectVideoPlay(buffer, size, pts)` per access unit in Annex B form,
+  `NDL_DirectVideoSetArea(x, y, w, h)` for the picture's place,
+  `NDL_DirectVideoFlushRenderBuffer`, `NDL_DirectMediaUnload`,
+  `NDL_DirectMediaQuit`. The codec is one of H.264, HEVC, VP9 and AV1. The
+  Load callback events are 0x16 loaded, 0x1a playing and 0x17 unloaded. PTS
+  is in milliseconds.
+- It must be loaded with `dlopen` and is not thread safe. It accepts data
+  without back-pressure, and a whole clip fed at once freezes the picture,
+  so the feeder paces. Stopping the feed holds the last frame, and feeding
+  again resumes.
+- The bus role is keyed on the executable path. `LSRegister` succeeds from
+  the app's own `main` executable and nowhere else, so the code that calls
+  NDL has to run as `geckotv` and not as Firefox.
+- LG's implementation runs a GStreamer pipeline in the calling process on
+  the TV's GLib. Firefox's runtime bundles its own GLib and GTK, so NDL
+  cannot live inside a Firefox process. Both facts point to a helper
+  process started from the launcher binary and fed by Firefox.
+- The decoded picture is a hardware plane under the graphics plane. The app
+  has to leave its window transparent where the video shows, and the
+  compositor only honours that for the foreground app. The window exports a
+  region for the video through `wl_webos_foreign` (`src/webos-foreign.xml`),
+  and the exported window id goes into `NDL_DirectMediaSetWindowId`.
+
+### Starfish: the pipeline that paces, plays audio and reports its clock
+
+NDL in its game mode shows a frame when it receives it, so a helper feeding
+it has to be the presentation clock, and the helper written for it first
+stuttered on the webOS 6.5.3 TV. That helper was never committed.
+LG's other interface is `StarfishMediaAPIs` in `libplayerAPIs.so.1`, which
+LG's own browser and the native players PlxNative, webos-native-app-kit and
+Kodi use. Both elementary streams go into one pipeline that decodes, paces
+by presentation time, plays the audio and reports the time of the frame on
+screen. The facts below come from those projects and the TV, measured there
+on webOS 6.5.3 unless noted.
+
+- One C++ object made by `new StarfishMediaAPIs(nullptr)`, then
+  `notifyForeground()`, `Load(json, callback, data)` with
+  `mediaTransportType` BUFFERSTREAM, `Feed(json)` per access unit answering
+  a string with `Ok` or `BufferFull`, `Play`, `Pause`, `flush`,
+  `Seek("<ms>")`, `pushEOS`, `setVolume`, `Unload`. The Feed payload carries
+  `bufferAddr`, `bufferSize`, `pts` in ns and `esData` 1 for video and 2 for
+  audio. The events are FRAMEREADY 0x0 with the presentation time in ns,
+  LOADCOMPLETED 0x16, PLAYING 0x1a, PAUSED 0x1b, ENDOFSTREAM 0x1c, SEEKDONE
+  0x19, and errors 0x12 and 0x13. `Play()` before LOADCOMPLETED is queued
+  and re-issued at LOADCOMPLETED.
+- The picture's place on webOS 5 and later is `option.windowId` in the Load
+  payload. That is the id of a window exported through `wl_webos_foreign`,
+  and the exported window's destination region places the plane. Older
+  ports use `libAcbAPI.so.1` for that, and it is absent from 5.3.1 on.
+- `Seek` after `flush()` runs a FLUSH|KEY_UNIT seek and starts a new
+  segment at the milliseconds passed. The kit calls `Seek(<its own ms>)`
+  with the first packet fed after the flush. The first new frame comes 0.17
+  to 0.33 s after the request with no dropped frames.
+- Declaring a frame rate above the stream's judders. 24p declared at 60
+  came out at 13 fps presented. So the stream's rate is declared.
+- `SetPlayRate` does not work for buffer feeding. AAC goes in as ADTS
+  frames. Opus is not taken as is.
+- The library's symbols are the cxx11 string ABI
+  (`_ZN17StarfishMediaAPIs4FeedB5cxx11EPKc`), so a caller built against
+  another libstdc++ reads the returned string by its layout and frees its
+  buffer with `free()`.
+
+### What is built (2026-11-16)
+
+Hardware video works only in GL window mode, on webOS 5 and 6 with a GPU.
+The flat window of software rendering copies frames on the CPU and has no
+alpha the compositor would blend. There are four pieces.
+
+- **Firefox's media engine** is `build/patches/webos-media-engine.patch`
+  (`dom/media/platforms/webos/`), an `ExternalPlaybackEngine` for
+  Firefox's own `ExternalEngineStateMachine`. That state machine is the
+  machinery Windows uses for its Media Foundation engine. The patch is
+  built with `--enable-webos-media-engine`. A media decoder picks that
+  state machine when `media.webos.engine.enabled` is set and the launcher
+  exported `GECKOTV_MEDIA_HELPER`. The engine takes unencrypted H.264 or
+  VP9 with AAC or no audio. Anything else, and anything the pipeline
+  refuses before it is loaded, ends in
+  `NS_ERROR_DOM_MEDIA_EXTERNAL_ENGINE_NOT_SUPPORTED_ERR` and Firefox's
+  normal state machine plays in software from the same position. That
+  hand-over now seeks to the position, where before it restarted at 0. The
+  engine starts `geckotv --media-helper` with a socketpair on fd 3 and a
+  clean environment, and talks to it in requests and replies
+  (`src/media-protocol.h`) from one task queue. Every 25 ms it hands over
+  the one sample per track that waits in it when that sample's time is
+  within the lead of the pipeline's clock, and otherwise asks for the
+  pipeline's state. The lead is 750 ms, or 2 s until the pipeline has
+  shown a frame. Every reply carries the time of the frame on screen, which
+  is the engine's clock. The pass-through decoders of
+  `WebOSEngineDecoderModule` run in the content process and are registered
+  first. They only act on decoders created with the engine's id, and the
+  RDD module refuses those, so no sample of an engine playback is decoded
+  elsewhere. They return placeholder frames, and Firefox's A/V logic,
+  seeking and ready states keep working on them. A seek moves the clock to
+  the target, drops the waiting samples, sends `SEEK` to the helper and
+  posts `Seeked` at once, while the state machine still waits for the
+  demuxer's seek. A playback rate other than 1 hands over to software.
+  Looping, picture-in-picture and `drawImage` of the video are not served
+  by the plane.
+- **The helper** is `src/media-helper.cc`. It is C++ with libstdc++ linked
+  statically and hidden, and it is a mode of the launcher so that it runs
+  under the app's bus role and with the TV's libraries. It `dlopen`s
+  `libplayerAPIs.so.1` and calls the members through their mangled names as
+  free functions. On ARM EABI `this` goes in r0, and for a returned
+  std::string the slot goes in r0 and `this` in r1. `Load` runs on a thread
+  of its own because it can block for seconds or for ever, while the socket
+  loop keeps answering so that Firefox can give up and kill the helper.
+  After a `flush()` the first video packet is fed with `Seek(<its ms>)` in
+  front, and FRAMEREADY events between the two are dropped as belonging to
+  the old position. `tests/media-helper/run.sh` drives it on the build host
+  against a stub `libplayerAPIs.so.1` that exports the TV's symbol names.
+- **The hole.** Firefox clears the window to alpha 0 where the video is, so
+  the compositor shows the plane through it and the controls, captions and
+  everything else painted after the video stay on top. LG's browser does
+  the same with Chromium's video hole quad. WebRender already had the
+  operation. Its `Cutout` pattern is a dest-out blend that cuts the
+  picture-cache tile under an underlay compositor surface. The patch
+  exposes it as a display item. A rectangle with `PrimitiveFlags::IS_CUTOUT`
+  draws that pattern on the quad path or opaque black with dest-out on the
+  brush path, is never taken as an opaque backdrop, and reaches Gecko as
+  `DisplayListBuilder::PushClearRect`. `nsVideoFrame` pushes it instead of
+  the frames while the element's decoder reports that the engine renders,
+  and reports the video's rectangle on screen (window device pixels) to
+  the element, the decoder, the state machine and the engine. The content
+  slice's tiles are opaque because they hold the page canvas, and opaque
+  tiles are composited with blending off, so the zeros reach the
+  framebuffer. Firefox marks the chrome's opaque parts as the surface's
+  opaque region, which would let the compositor skip blending there, so
+  the adapter drops `wl_surface.set_opaque_region` on the GL window.
+- **The adapter** exports one video element on the GL window through
+  `wl_webos_foreign` (`src/webos-xdg.c`, `video_*`). It listens on the unix
+  socket the launcher named in the profile folder under a random name,
+  checks the peer uid, takes one client at a time and replaces a gone
+  client at once. It sends the client `windowid <id>` and takes
+  `rect x y w h vw vh` lines. The destination region is the rect clipped to
+  the window, and the source region is the part of the natural `vw x vh`
+  video that lands in it. `rect 0 0 0 0 0 0` or a closed socket clears the
+  region. `tests/adapter/run.sh` checks the clipping on the host.
+- **The launcher** sets `GECKOTV_MEDIA_HELPER` and `GECKOTV_VIDEO_SOCKET`
+  in GL window mode when `/usr/lib/libplayerAPIs.so.1` exists.
+  `GECKOTV_HWVIDEO=0|1` in the `env` file overrides.
+
+### First TV round (webOS 6.5, 2026-11-16)
+
+A direct H.264 + AAC mp4 of 320x176 at 25 fps played through the pipeline.
+The helper started under the app's role, loaded with the exported window
+id, the pipeline reported PLAYING and the adapter placed the plane under
+the hole (`video plane at 800,519 320x176`). The picture showed through the
+window with the page over it, so the compositor blends the GL window's
+alpha. The pipeline reached end of stream after the clip's 10 s.
+
+The picture stuttered. The engine was handing over one sample per track
+per 25 ms tick. That is 40 samples/s and below AAC's 47 frames/s at
+48 kHz, so the pipeline's audio clock starved. Samples now go out as they
+arrive from the reader with one in flight per track and a round trip under
+a few ms, and the tick only releases samples held back for the lead.
+
+A second run of the same clip on the same build played without stutter,
+so the round-5 stutter had at least one other cause. The throughput cap
+stands as a defect on its own because a longer clip drains the 2 s preroll.
+
+YouTube refused the engine. It negotiated Opus audio with VP9 video in
+WebM containers, Firefox fell back to its own state machine, and that path
+failed after the first frames. `media.mediasource.webm.enabled` no longer
+exists in ESR 153, so the pref this build set was dead. With reader
+logging the raiser is Firefox's bundled VP9 decoder on the `vp09.00.51`
+stream, which logs `FFmpegVideoDecoder::DoDecode: avcodec_send_packet
+error: Invalid data found when processing input`. After that the reader
+finds no next keyframe to skip to and raises the bare
+`NS_ERROR_DOM_MEDIA_FATAL_ERR`. A control run with
+`media.webos.engine.enabled=false` fails identically, so this predates the
+engine. YouTube then retries with H.264 and the TV's FFmpeg fails the same
+way on it with `Invalid data found`, so software decoding of YouTube's
+streams is broken on this build for a reason of its own that is not yet
+looked into. `MediaSource.isTypeSupported` now refuses codecs the pipeline
+has no decoder for while the engine is available, so a site negotiates
+H.264/VP9 + AAC as it does with LG's browser. That browser's Media Source
+support is the pipeline's.
+
+Both played on the pipeline with 0.1.43 and the leftover pref stripped.
+The mp4 with H.264 + AAC fed 250 video and 470 audio samples to end of
+stream. YouTube now negotiated VP9 1920x1080 at 60 fps with AAC
+(`webOS engine supported=1`, `LOAD at 0 us, 58824/1000 fps`), loaded in
+about a second, placed the plane under the player (`video plane at
+107,213 1470x827`) following the layout as the page resized it, and
+advanced its position in real time with 13.9 s of media after 14 s.
+
+A direct mp4 opened two media decoders in one session, so two helpers ran
+two pipelines on VDEC ports 2 and 3, and the TV has two decoders. The
+adapter's video socket takes one client, so the second engine ran with no
+window id and no picture. Why the media document made two decoders is open.
+
+Script notes. `pkill -f firefox-runtime` over ssh kills the remote shell
+that runs it because its own command line matches, so use `firefo[x]`. A
+pref set through `user.js` for one run stays in `prefs.js` after the file
+is removed. The launcher's note on `gfx.webrender.software` describes the
+same trap. A control run with `media.webos.engine.enabled=false` switched
+the engine off for the rounds after it until the line was stripped.
+
+### To check on the TV
+
+Check these in order in `geckotv.log` after playing a local H.264 + AAC
+clip in a page and then YouTube.
+
+- `media-helper: started` and `Starfish library loaded` mean the helper
+  runs under the app's role with the TV's libraries.
+- `video window exported as <id>` from the adapter and
+  `open: ... window <id>` from the helper mean the id reached the Load
+  payload.
+- `load completed`, then `event 0x1a` (PLAYING) and time advancing in the
+  engine's log (`MOZ_LOG=WebOSEngine:4` in the `env` file).
+- `video plane at x,y wxh` from the adapter and the picture inside the
+  element with the page's controls over it mean the hole and the plane
+  agree. A black rectangle instead means the compositor did not blend the
+  window's alpha, and the adapter's `opaque region dropped` line says
+  whether Firefox asked for one.
+- Whether `set_exported_window`'s source region crops the video or is
+  ignored. The adapter passes the natural video rect and the compositor
+  scales it.
+- Seek with the remote. Expect `flushed for a seek`, `Seek(<ms>) ok`, a new
+  frame within 0.5 s and sound in sync.
+- Two videos on one page. Whether the second Load is refused or the first
+  pipeline is preempted by a policy action with no error event.
+- Killing the helper mid-play with `kill -9` and starting a new video.
+  Whether the decoder was released.
+- Lip sync and 24 fps content on the 60 Hz panel. `videoFpsValue` is the
+  stream's rate.

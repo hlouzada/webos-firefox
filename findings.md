@@ -1054,6 +1054,89 @@ identity pop-ups and tooltips were verified to draw and work, also while a
 YouTube video plays on the hardware plane (section 21). A second GTK
 toplevel still gets a card of its own as before.
 
+**Pop-ups drawn with the GPU (0.1.46).** Installing an add-on froze Firefox
+on that TV every time in three attempts on 2026-11-17. The install prompt
+opened and nothing appeared, the extensions button stayed pressed, and
+the log ended with `flat: surface X committed buffer Y the window cannot
+copy (not a wl_shm buffer of this process)`. Firefox's main thread sat in
+futex_wait with no crash and no minidump. Firefox gives a pop-up widget
+GPU acceleration only when its panel is marked `remote="true"`
+(`nsWindow::WidgetTypeSupportsAcceleration`, widget/gtk/nsWindow.cpp). The
+popup notifications panel `#notification-popup` in
+browser/base/content/popup-notifications.inc.xhtml is one, so unlike a
+menu the install prompt commits Mali buffers on its content subsurface.
+The overlay copies shared memory only, the pop-up was never shown, and
+the Mali swap waited for a frame callback of a surface the compositor
+never saw. Extension pop-ups themselves are not remote here because
+`extensions.webextensions.remote` is false, so only the hard-coded remote
+panels are affected.
+
+The adapter now gives such a surface a window of its own in `gp_attach`.
+At its first attach a pop-up content surface whose buffer is not from this
+process's `wl_shm` is taken out of the overlay, gets a wl_shell toplevel
+role and a webOS shell surface typed OVERLAY, and its attach, damage,
+frame and commit requests pass through. A shared-memory one is still tagged
+SUBSURFACE then and stays copied. Since the compositor minimizes the card
+the moment a surface of the app goes away, the window is never unmapped or
+destroyed. Firefox hides a pop-up by attaching no buffer and keeps the
+surface (WaylandSurface::UnmapLocked), so an empty attach is replaced by a
+transparent 1x1 buffer. The destroy request only comes when the widget
+dies, and it is swallowed and the surface parked behind that buffer. On
+the next show Firefox makes a new subsurface of GTK's new pop-up surface,
+and `gp_reparent` re-attaches the window to it. This TV's compositor sends
+the app no pointer events, so clicks come from evdev and are routed by
+rectangle. `apply_remote_event` now asks `ov_hit`, which knows the
+overlay's pop-ups and the GPU ones, so a click inside a pop-up reaches
+GTK's pop-up surface rather than the window. Keyboard focus on a GPU
+pop-up reads as GTK's window, as on the overlay. The webOS shell surface's
+`position_changed` event is logged to see where the compositor puts it.
+The host test is `tests/adapter/gpu-popup.c`.
+
+With the window typed OVERLAY it showed for half a second and Firefox was
+gone in three runs. A SIGTERM handler added to the adapter for the hunt
+showed the sender. `/usr/sbin/sam` sent it to every Firefox process right
+after LSM reported the card not visible, 400 ms after the new window
+mapped, with no Wayland error. The variants below ran from a one-off build
+with env knobs for the window's role, type, state, input region and
+hiding, and with a test hook that mapped a shared-memory window from the
+adapter some seconds after the GL window showed, so no add-on install was
+needed. They were launched from a shell with `ssh -tt` and then
+`luna-send-pub ... applicationManager/launch`, because without a terminal
+the bus answers nothing. Those knobs, the hook and the handler are gone
+again, and this record is what they found.
+
+- OVERLAY 446x286 with or without an input region, and OVERLAY 1920x1080.
+  The keyboard focus moves to the new window with a `KEYBOARD enter` on it
+  and no return, LSM hides the card 300 to 400 ms later, and SAM closes the
+  app. The startup overlay survives only because it maps during the launch
+  transition.
+- FLOATING 446x286. No focus change, the card stays, the window shows,
+  hides behind the transparent buffer and the app lives on.
+
+- FLOATING 446x286 as a toplevel or as a transient with the inactive flag.
+  Three runs of four went as above and stayed alive. In the fourth the
+  focus moved to the window 400 ms after it mapped and the app died the
+  same way, so a FLOATING window is spared only while nothing activates it.
+
+So GPU pop-ups are typed FLOATING and get an empty input region with
+Firefox's own set_input_region on them swallowed, so a click or hover of
+the Magic Remote cannot pick the window. The adapter's hit test routes the
+clicks. A transient role with the inactive flag made no difference to a
+FLOATING window and is not used.
+
+On the TV the FLOATING window lands at the top left whatever it asked, and
+LSM sends no `position_changed`, so clicks are taken there.
+`WEBOS_XDG_GPU_POPUP_PLACED=asked` is for a compositor that honours the
+place. With that the add-on install prompt shows and its buttons work.
+Two things were found on the way. The content surface of a second GTK
+toplevel is a pop-up child to the adapter too. A tab torn off the strip
+makes one. A window of its own for it hid the card and closed the app, so
+only the content of a surface with an xdg_popup role is promoted. And
+clicks routed into a pop-up left the synthetic pointer focus on its GTK
+surface after GTK destroyed it, so the next click sent a leave for freed
+memory and crashed with SIGSEGV at 0xe5e5e5e5 twice. The focus is dropped
+when its surface is destroyed.
+
 **The keyboard crash (0.1.28).** On that TV Firefox closed whenever a text
 field lost focus (Wikipedia's search box, the address bar, other pages):
 `invalid arguments for text_model@NN.set_max_text_length`, then

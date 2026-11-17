@@ -38,7 +38,7 @@ struct wl_display *webos_xdg_proxy_display(struct wl_proxy *p) { (void)p; return
 int webos_xdg_on_default_queue(struct wl_proxy *p) { (void)p; return 1; }
 STUBS
 status=0
-for t in video-clip toplevel-state; do
+for t in video-clip toplevel-state gpu-popup; do
     gcc -std=gnu11 -w -I"$GEN" -I"$PREFIX/include" -o "$BUILD/$t" "$HERE/$t.c" \
         "$GEN"/*-protocol.c "$GEN/stubs.c" -L"$PREFIX/lib" -Wl,-rpath,"$PREFIX/lib" \
         -lwayland-client -lxkbcommon -lpthread -ldl -lm

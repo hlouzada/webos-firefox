@@ -3492,17 +3492,31 @@ static void text_model_send(int which, uint32_t arg)
         wl_proxy_marshal_flags(p, opcode, NULL, wl_proxy_get_version(p), 0);
 }
 
+/* The surface the compositor last gave the keyboard to, as it named it. */
+static struct wl_surface *keyboard_focus_raw;
+
 static void show_keyboard(void)
 {
+    struct wl_surface *target;
+
     ensure_text_model();
     if (!text_input || !our_seat || !main_surface)
         return;
+    /* The panel comes up only for the surface that has the keyboard. In GL
+     * mode that is the pop-up overlay once it has mapped, not the window. */
+    if (gl_mode() && keyboard_focus_raw &&
+        (keyboard_focus_raw == ov_surface || keyboard_focus_raw == (struct wl_surface *)gl_window))
+        target = keyboard_focus_raw;
+    else if (gl_mode() && gl_window)
+        target = (struct wl_surface *)gl_window;
+    else if (flat_mode() && ov_surface)
+        target = ov_surface;
+    else
+        target = main_surface;
     text_model_set_content_type(text_input, 0x100, 5);
     text_model_send(TM_ENTER_KEY_TYPE, 3);
     text_model_set_surrounding_text(text_input, "", 0, 0);
-    text_model_activate(text_input, ++g.serial, our_seat,
-                        gl_mode() && gl_window ? (struct wl_surface *)gl_window
-                        : flat_mode() && ov_surface ? ov_surface : main_surface);
+    text_model_activate(text_input, ++g.serial, our_seat, target);
     text_model_send(TM_SHOW_PANEL, 0);
     keyboard_up = 1;
     log_msg("keyboard shown");
@@ -4300,6 +4314,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t se
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
     focused_keys = hook;
+    keyboard_focus_raw = surface;
     surface = input_surface(surface);
     log_msg("KEYBOARD enter surface=%p", (void *)surface);
     /* LSM treats a popup subsurface as separately focusable and hands it the
@@ -4326,6 +4341,8 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     struct hook *hook = hook_find(keyboard_hooks, keyboard);
     const struct wl_keyboard_listener *orig = hook ? hook->listener : NULL;
 
+    if (keyboard_focus_raw == surface)
+        keyboard_focus_raw = NULL;
     surface = input_surface(surface);
     log_msg("KEYBOARD leave surface=%p", (void *)surface);
     if (is_popup_surface(surface)) {

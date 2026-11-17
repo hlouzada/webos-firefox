@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "media-helper.h"
+
 /* Entry point. webOS runs this ELF, which sets up the environment and execs
  * the native 32-bit Firefox in firefox-runtime. */
 
@@ -245,6 +247,8 @@ int main(int argc, char **argv)
     ssize_t n;
     char *slash;
 
+    if (argc > 1 && strcmp(argv[1], "--media-helper") == 0)
+        return media_helper_main(argc, argv);
     n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n < 0)
         return 1;

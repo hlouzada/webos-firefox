@@ -37,8 +37,25 @@ $(GEN)/webos-foreign-protocol.c: src/webos-foreign.xml
 	mkdir -p $(GEN)
 	$(SCANNER) private-code $< $@
 
-app/geckotv: src/geckotv.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl
+# The launcher is C. Its media helper mode (src/media-helper.cc) is C++
+# with libstdc++ linked in statically and hidden so that LG's media
+# library keeps binding to the TV's own libstdc++. The dynamic list exports
+# the PmLog entry points the helper defines so that LG's libraries log into
+# geckotv.log.
+CXX := $(TC)/bin/arm-webos-linux-gnueabi-g++
+CXXFLAGS := --sysroot=$(SYSROOT) -O2 -Wall -Wextra -std=gnu++17 -fvisibility=hidden
+GECKOTV_OBJ := $(GEN)/geckotv.o $(GEN)/media-helper.o
+
+$(GEN)/geckotv.o: src/geckotv.c src/media-helper.h
+	mkdir -p $(GEN)
+	$(CC) $(CFLAGS) -std=gnu11 -Isrc -c -o $@ $<
+$(GEN)/media-helper.o: src/media-helper.cc src/media-helper.h src/media-protocol.h
+	mkdir -p $(GEN)
+	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
+app/geckotv: $(GECKOTV_OBJ) src/geckotv.dynlist
+	$(CXX) --sysroot=$(SYSROOT) -o $@ $(GECKOTV_OBJ) -static-libstdc++ \
+		-Wl,--exclude-libs,libstdc++.a:libsupc++.a -Wl,--dynamic-list=src/geckotv.dynlist \
+		-lpthread -ldl
 	chmod 755 $@
 
 icons:

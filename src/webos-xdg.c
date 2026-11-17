@@ -82,6 +82,8 @@ struct virt {
     int injected_ddm;
     int injected_sub;
     int configured;
+    /* For V_TOPLEVEL, set between set_fullscreen and unset_fullscreen. */
+    int fullscreen;
     /* V_SUBSURFACE: the surfaces it joins, as Firefox asked. */
     struct wl_proxy *sub_child;
     struct wl_proxy *sub_parent;
@@ -769,13 +771,14 @@ static void emit_toplevel_configure(struct virt *toplevel)
         }
     }
     g.serial++;
-    /* Fullscreen state makes Firefox slide the tab strip and address bar
-     * off the top. The compositor still shows the surface full-screen via
-     * wl_webos_shell; tell the client it is a maximized window instead. */
+    /* These states do not change what LSM shows, which is always the full
+     * card. FULLSCREEN is needed because GDK turns it into the window-state
+     * event Firefox waits for before requestFullscreen() completes. */
     wl_array_init(&states);
     state = wl_array_add(&states, sizeof *state);
     if (state)
-        *state = XDG_TOPLEVEL_STATE_MAXIMIZED;
+        *state = toplevel->fullscreen ? XDG_TOPLEVEL_STATE_FULLSCREEN
+                                      : XDG_TOPLEVEL_STATE_MAXIMIZED;
     state = wl_array_add(&states, sizeof *state);
     if (state)
         *state = XDG_TOPLEVEL_STATE_ACTIVATED;
@@ -792,7 +795,7 @@ static void emit_toplevel_configure(struct virt *toplevel)
     }
     toplevel->configured = 1;
     emitting = 0;
-    log_msg("configure serial %u", g.serial);
+    log_msg("configure serial %u fullscreen=%d", g.serial, toplevel->fullscreen);
 }
 
 static int flat_mode(void);
@@ -3297,9 +3300,20 @@ static struct wl_proxy *virt_request(struct virt *v, uint32_t opcode, uint32_t f
             }
         }
     }
-    if (v->kind == V_TOPLEVEL &&
-        (opcode == XDG_TOPLEVEL_SET_FULLSCREEN || opcode == XDG_TOPLEVEL_SET_MAXIMIZED))
-        emit_toplevel_configure(v);
+    if (v->kind == V_TOPLEVEL) {
+        switch (opcode) {
+        case XDG_TOPLEVEL_SET_FULLSCREEN:
+        case XDG_TOPLEVEL_UNSET_FULLSCREEN:
+            v->fullscreen = opcode == XDG_TOPLEVEL_SET_FULLSCREEN;
+            /* fallthrough */
+        case XDG_TOPLEVEL_SET_MAXIMIZED:
+        case XDG_TOPLEVEL_UNSET_MAXIMIZED:
+            emit_toplevel_configure(v);
+            break;
+        default:
+            break;
+        }
+    }
     if (opcode == 0 && v->proxy) {
         struct wl_proxy *dying = v->proxy;
 

@@ -34,6 +34,12 @@ wayland-scanner client-header "$ROOT/src/text-model.xml" \
     "$GEN/text-model-client-protocol.h"
 wayland-scanner private-code "$ROOT/src/text-model.xml" \
     "$GEN/text-model-protocol.c"
+# webOS foreign surfaces (LG, Apache-2.0, from webosose/webos-wayland-extensions).
+# The window exports a region where the hardware video plane shows through.
+wayland-scanner client-header "$ROOT/src/webos-foreign.xml" \
+    "$GEN/webos-foreign-client-protocol.h"
+wayland-scanner private-code "$ROOT/src/webos-foreign.xml" \
+    "$GEN/webos-foreign-protocol.c"
 cp "$ROOT/src/webos-xdg.c" "$GEN/webos-xdg.c"
 python3 - <<'PY'
 from pathlib import Path
@@ -233,6 +239,11 @@ if "webos-surface-group-protocol.c" not in m:
     if needle not in m:
         raise SystemExit("text model source missing")
     m = m.replace(needle, "'text-model-protocol.c',\n\t'webos-surface-group-protocol.c'", 1)
+if "webos-foreign-protocol.c" not in m:
+    needle = "'webos-surface-group-protocol.c'"
+    if needle not in m:
+        raise SystemExit("surface group source missing")
+    m = m.replace(needle, "'webos-surface-group-protocol.c',\n\t'webos-foreign-protocol.c'", 1)
 mb.write_text(m)
 print("patched")
 PY

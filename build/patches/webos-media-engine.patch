@@ -478,6 +478,71 @@ index 6af74f901d..3d914706f5 100644
    if (StaticPrefs::media_gpu_process_decoder()) {
      StartupPDM(RemoteDecoderModule::Create(RemoteMediaIn::GpuProcess));
    }
+diff --git a/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp b/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
+index 7cf113956f..720c77fae5 100644
+--- a/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
++++ b/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
+@@ -76,12 +76,14 @@ class EMEDecryptor final : public MediaDataDecoder,
+                TrackInfo::TrackType aType,
+                const std::function<MediaEventProducer<TrackInfo::TrackType>*()>&
+                    aOnWaitingForKey,
+-               UniquePtr<ADTSSampleConverter> aConverter = nullptr)
++               UniquePtr<ADTSSampleConverter> aConverter = nullptr,
++               bool aKeepADTS = false)
+       : mDecoder(aDecoder),
+         mProxy(aProxy),
+         mSamplesWaitingForKey(
+             new SamplesWaitingForKey(mProxy, aType, aOnWaitingForKey)),
+         mADTSSampleConverter(std::move(aConverter)),
++        mKeepADTS(aKeepADTS),
+         mIsShutdown(false) {
+     DDLINKCHILD("decoder", mDecoder.get());
+   }
+@@ -169,7 +171,7 @@ class EMEDecryptor final : public MediaDataDecoder,
+       return;
+     }
+ 
+-    if (mADTSSampleConverter &&
++    if (mADTSSampleConverter && !mKeepADTS &&
+         !mADTSSampleConverter->Revert(aDecrypted.mSample)) {
+       mDecodePromise.RejectIfExists(
+           MediaResult(
+@@ -289,6 +291,8 @@ class EMEDecryptor final : public MediaDataDecoder,
+   MozPromiseHolder<FlushPromise> mFlushPromise;
+   MozPromiseRequestHolder<DecodePromise> mDecodeRequest;
+   UniquePtr<ADTSSampleConverter> mADTSSampleConverter;
++  // Leave the ADTS header on the decrypted frame: the decoder wants it.
++  const bool mKeepADTS;
+   bool mIsShutdown;
+ };
+ 
+@@ -477,16 +481,24 @@ EMEDecoderModule::AsyncCreateDecoder(const CreateDecoderParams& aParams) {
+     // See bug 1433344.
+     converter = MakeUnique<ADTSSampleConverter>(aParams.AudioConfig());
+   }
++  bool keepADTS = false;
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // The webOS engine's decoder passes the CDM's output to a pipeline that
++  // takes AAC as ADTS frames, and that output cannot be re-framed anyway:
++  // it is the TV CDM's secure-path wrapping of the sample.
++  keepADTS = aParams.mMediaEngineId.isSome();
++#endif
+ 
+   RefPtr<EMEDecoderModule::CreateDecoderPromise> p =
+       mPDM->CreateDecoder(aParams)->Then(
+           GetCurrentSerialEventTarget(), __func__,
+           [self = RefPtr{this}, params = CreateDecoderParamsForAsync(aParams),
+-           converter = std::move(converter)](
++           converter = std::move(converter), keepADTS](
+               RefPtr<MediaDataDecoder>&& aDecoder) mutable {
+             RefPtr<MediaDataDecoder> emeDecoder(new EMEDecryptor(
+                 aDecoder, self->mProxy, params.mType,
+-                params.mOnWaitingForKeyEvent, std::move(converter)));
++                params.mOnWaitingForKeyEvent, std::move(converter),
++                keepADTS));
+             return EMEDecoderModule::CreateDecoderPromise::CreateAndResolve(
+                 emeDecoder, __func__);
+           },
 diff --git a/dom/media/platforms/moz.build b/dom/media/platforms/moz.build
 index 1bd4af56f2..20f90f83f7 100644
 --- a/dom/media/platforms/moz.build

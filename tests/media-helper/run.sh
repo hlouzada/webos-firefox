@@ -72,11 +72,24 @@ run failload STUB_FAIL_LOAD=1
 check "LOAD accepted, status then FAILED without PIPELINE" \
     '[ "$(field failload load result)" = 0 ] && [ $(( $(field failload status flags) & 17 )) = 16 ]'
 
+echo "== protected: a Widevine stream loads the pipeline for the secure video path"
+run protected
+check "open accepted and the pipeline loads" \
+    '[ "$(field protected open result)" = 0 ] && [ $(( $(field protected pipeline flags) & 1 )) = 1 ]'
+check "Load payload carries drm type WIDEVINE_MODULAR and svpVersion 40 in externalStreamingInfo" \
+    'grep -q "load .*\"drm\":{\"type\":\"WIDEVINE_MODULAR\"}.*\"externalStreamingInfo\":{\"svpVersion\":40,\"contents\"" "$BUILD/protected.stub"'
+run protected-svp GECKOTV_SVP_VERSION=30
+check "GECKOTV_SVP_VERSION overrides the svpVersion" 'grep -q "\"svpVersion\":30," "$BUILD/protected-svp.stub"'
+check "a clear stream's Load payload has neither" \
+    '! grep -q "svpVersion\|WIDEVINE" "$BUILD/play.stub"'
+
 echo "== refusals"
 run badopen
 check "unknown video codec refused" '[ "$(field badopen open result)" = 2 ]'
 run unsupported
 check "non-AAC audio refused" '[ "$(field unsupported open result)" = 2 ]'
+run badprotection
+check "unknown protection refused" '[ "$(field badprotection open result)" = 2 ]'
 
 echo "build dir: $BUILD"
 exit $fail

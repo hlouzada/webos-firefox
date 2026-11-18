@@ -416,20 +416,21 @@ index ee40a73fd4..3917666011 100644
  
  #include <algorithm>
  
-@@ -85,6 +88,12 @@ MediaSourceDecoder::CreateStateMachine(bool aDisableExternalEngine) {
+@@ -85,6 +88,13 @@ MediaSourceDecoder::CreateStateMachine(bool aDisableExternalEngine) {
        !aDisableExternalEngine) {
      return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
    }
 +#endif
 +#ifdef MOZ_WEBOS_MEDIA_ENGINE
-+  // Encrypted media is refused by the engine once the metadata is known.
++  // Encrypted media plays here too: the CDM wraps its samples for the
++  // pipeline's secure video path.
 +  if (WebOSEngine::IsAvailable() && !aDisableExternalEngine) {
 +    return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
 +  }
  #endif
    return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
  }
-@@ -391,7 +400,7 @@ bool MediaSourceDecoder::HadCrossOriginRedirects() {
+@@ -391,7 +401,7 @@ bool MediaSourceDecoder::HadCrossOriginRedirects() {
    return false;
  }
  
@@ -503,10 +504,10 @@ index 1bd4af56f2..20f90f83f7 100644
  if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
 new file mode 100644
-index 0000000000..dfca0305af
+index 0000000000..2f9d14a41f
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,991 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -581,6 +582,7 @@ index 0000000000..dfca0305af
 +enum { GM_TRACK_VIDEO = 1, GM_TRACK_AUDIO = 2 };
 +enum { GM_VIDEO_H264 = 1, GM_VIDEO_VP9 = 2 };
 +enum { GM_AUDIO_NONE = 0, GM_AUDIO_AAC = 3 };
++enum { GM_PROTECTION_NONE = 0, GM_PROTECTION_WIDEVINE = 1 };
 +enum { GM_OK = 0, GM_RETRY = 1, GM_UNSUPPORTED = 2, GM_ERROR = -1 };
 +enum {
 +  GM_F_PIPELINE = 1,
@@ -597,6 +599,7 @@ index 0000000000..dfca0305af
 +  uint32_t audio_channels;
 +  uint32_t audio_profile;
 +  uint32_t audio_frequency_index;
++  uint32_t protection;
 +  char window_id[128];
 +};
 +
@@ -628,7 +631,7 @@ index 0000000000..dfca0305af
 +
 +/* static */
 +bool WebOSEngine::SupportsFormat(const MediaInfo& aInfo) {
-+  if (!aInfo.HasVideo() || aInfo.IsEncrypted()) {
++  if (!aInfo.HasVideo()) {
 +    return false;
 +  }
 +  const nsCString& v = aInfo.mVideo.mMimeType;
@@ -724,7 +727,8 @@ index 0000000000..dfca0305af
 +      mImage = new layers::SourceSurfaceImage(surface);
 +    }
 +    mInited = true;
-+    LOG("helper %d ready, window %s", int(mPid), mWindowId.get());
++    LOG("helper %d ready, window %s%s", int(mPid), mWindowId.get(),
++        mInfo.IsEncrypted() ? ", protected" : "");
 +    ScheduleTick();
 +    return GenericNonExclusivePromise::CreateAndResolve(true, __func__);
 +  });
@@ -902,6 +906,8 @@ index 0000000000..dfca0305af
 +  } else {
 +    m.arg[5] = GM_AUDIO_NONE;
 +  }
++  p.protection =
++      mInfo.IsEncrypted() ? GM_PROTECTION_WIDEVINE : GM_PROTECTION_NONE;
 +  snprintf(p.window_id, sizeof p.window_id, "%s", mWindowId.get());
 +  if (!Request(m, &p, sizeof p, kOpenTimeoutMs)) {
 +    LOGW("helper did not answer OPEN");
@@ -1495,10 +1501,10 @@ index 0000000000..dfca0305af
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngine.h b/dom/media/platforms/webos/WebOSEngine.h
 new file mode 100644
-index 0000000000..dbbd1541dc
+index 0000000000..50f568acb2
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,191 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1564,6 +1570,9 @@ index 0000000000..dbbd1541dc
 +  RefPtr<GenericPromise> Flush(TrackInfo::TrackType aType);
 +
 +  const MediaInfo& Info() const { return mInfo; }
++  // Encrypted media: every sample arrives wrapped by the CDM for the
++  // pipeline's secure video path, audio frames already in ADTS.
++  bool Protected() const { return mInfo.IsEncrypted(); }
 +
 + private:
 +  ~WebOSEngineChannel();
@@ -1644,7 +1653,7 @@ index 0000000000..dbbd1541dc
 +
 +  // True when the launcher set up a helper for this run.
 +  static bool IsAvailable();
-+  // Unencrypted H.264 or VP9 video with no audio or AAC audio.
++  // H.264 or VP9 video with no audio or AAC audio, clear or encrypted.
 +  static bool SupportsFormat(const MediaInfo& aInfo);
 +  // The same codecs, for a Media Source type's codecs list.
 +  static bool SupportsCodecs(const MediaCodecs& aCodecs);
@@ -1671,7 +1680,10 @@ index 0000000000..dbbd1541dc
 +  void NotifyEndOfStream(TrackInfo::TrackType aType) override {
 +    mChannel->NotifyEndOfStream(aType);
 +  }
-+  bool SetCDMProxy(CDMProxy* aProxy) override { return false; }
++  // Encrypted samples reach the pipeline as the TV CDM's secure-path
++  // output. The reader's EME decryptor makes the CDM calls, so the
++  // engine keeps nothing of the proxy.
++  bool SetCDMProxy(CDMProxy* aProxy) override { return true; }
 +  void NotifyResizing(uint32_t aWidth, uint32_t aHeight) override {}
 +  void SetVideoRect(const gfx::IntRect& aRect) override {
 +    mChannel->SetVideoRect(aRect);
@@ -1686,10 +1698,10 @@ index 0000000000..dbbd1541dc
 +#endif  // DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
 diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
 new file mode 100644
-index 0000000000..44fba424a2
+index 0000000000..6e463df5d4
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,169 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1721,8 +1733,10 @@ index 0000000000..44fba424a2
 +
 +  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override {
 +    RefPtr<MediaRawData> sample = aSample;
-+    if (mInfo->GetType() == TrackInfo::kAudioTrack) {
-+      // The pipeline takes AAC as ADTS frames.
++    if (mInfo->GetType() == TrackInfo::kAudioTrack &&
++        !mChannel->Protected()) {
++      // The pipeline takes AAC as ADTS frames. Encrypted audio was
++      // framed before decryption and is passed through as it comes.
 +      const AudioInfo* audio = mInfo->GetAsAudioInfo();
 +      if (!ADTS::FrameHeader::MatchesSync(Span{sample->Data(), sample->Size()})) {
 +        sample = aSample->Clone();

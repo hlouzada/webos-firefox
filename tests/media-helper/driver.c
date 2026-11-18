@@ -110,7 +110,8 @@ static struct gm_msg simple(uint32_t type, int timeout_ms)
     return request(type, NULL, 0, NULL, 0, timeout_ms);
 }
 
-static struct gm_msg open_stream(int vcodec, int with_audio, const char *window)
+static struct gm_msg open_protected(int vcodec, int with_audio, const char *window,
+                                    unsigned protection)
 {
     int32_t args[6] = {vcodec, 1280, 720, 25, 1, with_audio ? GM_AUDIO_AAC : GM_AUDIO_NONE};
     struct gm_open o;
@@ -120,8 +121,14 @@ static struct gm_msg open_stream(int vcodec, int with_audio, const char *window)
     o.audio_channels = 2;
     o.audio_profile = 2;
     o.audio_frequency_index = 3;
+    o.protection = protection;
     snprintf(o.window_id, sizeof o.window_id, "%s", window);
     return request(GM_OPEN, args, 0, &o, sizeof o, 10000);
+}
+
+static struct gm_msg open_stream(int vcodec, int with_audio, const char *window)
+{
+    return open_protected(vcodec, with_audio, window, GM_PROTECTION_NONE);
 }
 
 static struct gm_msg feed(int track, int64_t pts_us, int key)
@@ -202,6 +209,16 @@ int main(int argc, char **argv)
         o.audio_rate = 48000;
         o.audio_channels = 2;
         r = request(GM_OPEN, a, 0, &o, sizeof o, 10000);
+        show("open", r);
+    } else if (!strcmp(scenario, "protected") || !strcmp(scenario, "protected-svp")) {
+        /* A Widevine stream: the pipeline is loaded for the secure video path. */
+        r = open_protected(GM_VIDEO_H264, 1, "w9", GM_PROTECTION_WIDEVINE);
+        show("open", r);
+        load_and_feed(2);
+        r = wait_for(GM_F_PIPELINE, 0, 3000);
+        show("pipeline", r);
+    } else if (!strcmp(scenario, "badprotection")) {
+        r = open_protected(GM_VIDEO_H264, 1, "w9", 7);
         show("open", r);
     } else if (!strcmp(scenario, "failload")) {
         r = open_stream(GM_VIDEO_H264, 1, "w1");

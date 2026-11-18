@@ -318,6 +318,56 @@ index ac3066049e..195a7bae09 100644
    virtual void SetCanPlayThrough(bool aCanPlayThrough) = 0;
    virtual void SetFragmentEndTime(const media::TimeUnit& aFragmentEndTime) = 0;
  
+diff --git a/dom/media/eme/KeySystemConfig.cpp b/dom/media/eme/KeySystemConfig.cpp
+index e812f981e9..cef267a163 100644
+--- a/dom/media/eme/KeySystemConfig.cpp
++++ b/dom/media/eme/KeySystemConfig.cpp
+@@ -11,6 +11,9 @@
+ #include "mozilla/dom/ChromeUtilsBinding.h"
+ #include "mozilla/dom/Promise.h"
+ #include "nsPrintfCString.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ 
+ #ifdef XP_WIN
+ #  include "PDMFactory.h"
+@@ -136,6 +139,16 @@ bool KeySystemConfig::Supports(const nsAString& aKeySystem) {
+   config->mAudioRobustness.AppendElement(u"SW_SECURE_CRYPTO"_ns);
+   config->mVideoRobustness.AppendElement(u"SW_SECURE_CRYPTO"_ns);
+   config->mVideoRobustness.AppendElement(u"SW_SECURE_DECODE"_ns);
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // The TV's CDM decrypts in its TEE and the pipeline decodes on the
++  // secure video path, which is what these levels promise.
++  if (WebOSEngine::IsAvailable()) {
++    config->mAudioRobustness.AppendElement(u"HW_SECURE_CRYPTO"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_CRYPTO"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_DECODE"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_ALL"_ns);
++  }
++#endif
+ 
+ #if defined(MOZ_WIDGET_ANDROID)
+   // MediaDrm.isCryptoSchemeSupported only allows passing
+diff --git a/dom/media/gmp/ChromiumCDMChild.cpp b/dom/media/gmp/ChromiumCDMChild.cpp
+index ed766b39bc..a969eb0baf 100644
+--- a/dom/media/gmp/ChromiumCDMChild.cpp
++++ b/dom/media/gmp/ChromiumCDMChild.cpp
+@@ -474,8 +474,14 @@ mozilla::ipc::IPCResult ChromiumCDMChild::RecvInit(
+     // Once the CDM is initialized we expect it to resolve mInitPromise via
+     // ChromiumCDMChild::OnInitialized
+     mCDM->Initialize(aAllowDistinctiveIdentifier, aAllowPersistentState,
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++                     // The TV's CDM decrypts into the pipeline's secure
++                     // video path, which it treats as a secure codec.
++                     true);
++#else
+                      // We do not yet support hardware secure codecs
+                      false);
++#endif
+   } else {
+     GMP_LOG_DEBUG(
+         "ChromiumCDMChild::RecvInit() mCDM not set! Is GMP shutting down?");
 diff --git a/dom/media/ipc/RemoteDecoderModule.cpp b/dom/media/ipc/RemoteDecoderModule.cpp
 index fff184abf1..1e06524c21 100644
 --- a/dom/media/ipc/RemoteDecoderModule.cpp

@@ -31,6 +31,7 @@ ac_add_options --disable-profiling
 ac_add_options --disable-geckodriver
 ac_add_options --enable-strip
 ac_add_options --enable-install-strip
+ac_add_options --enable-eme=widevine
 # --allow-shlib-undefined rides on the compiler command because configure's
 # own link tests ignore LDFLAGS (see the note below); -Qunused-arguments keeps
 # compile-only steps from warning about the linker flag.

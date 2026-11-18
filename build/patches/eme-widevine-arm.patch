@@ -1,0 +1,12 @@
+diff --git a/toolkit/moz.configure b/toolkit/moz.configure
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -931,7 +931,7 @@ def eme_choices(target, wmf):
+     if (
+         target.kernel in ("WINNT", "Linux")
+         and target.os != "Android"
+-        and target.cpu in ("x86", "x86_64")
++        and target.cpu in ("x86", "x86_64", "arm")
+     ):
+         if wmf:
+             return ("widevine", "wmfcdm")

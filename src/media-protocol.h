@@ -35,6 +35,12 @@ enum gm_audio_codec { GM_AUDIO_NONE = 0, GM_AUDIO_AAC = 3 };
 
 enum gm_result { GM_OK = 0, GM_RETRY = 1, GM_UNSUPPORTED = 2, GM_ERROR = -1 };
 
+/* gm_open.protection. With GM_PROTECTION_WIDEVINE every access unit is the
+ * TV CDM's secure-path (SVP inband) wrapping of the sample, which only the
+ * pipeline can unwrap; the helper loads it with drm type WIDEVINE_MODULAR
+ * and an svpVersion. */
+enum gm_protection { GM_PROTECTION_NONE = 0, GM_PROTECTION_WIDEVINE = 1 };
+
 /* Reply arg1 */
 enum gm_flags {
     GM_F_PIPELINE = 1,  /* Load() succeeded and the pipeline was not unloaded since */
@@ -62,6 +68,7 @@ struct gm_open {
     uint32_t audio_channels;
     uint32_t audio_profile;         /* AAC object type, 2 for LC */
     uint32_t audio_frequency_index; /* AAC sampling frequency index */
+    uint32_t protection;            /* enum gm_protection */
     char window_id[128];            /* exported window from the adapter, NUL-terminated, may be empty */
 };
 

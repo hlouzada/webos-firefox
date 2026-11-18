@@ -25,7 +25,7 @@ index c9b799cf07..30ef7d48f9 100644
    return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
  }
 diff --git a/dom/media/ExternalEngineStateMachine.cpp b/dom/media/ExternalEngineStateMachine.cpp
-index 2b0ef73252..d8871f85eb 100644
+index 2b0ef73252..bd14105a5c 100644
 --- a/dom/media/ExternalEngineStateMachine.cpp
 +++ b/dom/media/ExternalEngineStateMachine.cpp
 @@ -13,6 +13,9 @@
@@ -122,7 +122,7 @@ index 2b0ef73252..d8871f85eb 100644
    if (aError != NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA ||
        aError != NS_ERROR_DOM_MEDIA_CANCELED) {
 diff --git a/dom/media/ExternalEngineStateMachine.h b/dom/media/ExternalEngineStateMachine.h
-index 17f7186140..112cb9bd17 100644
+index 17f7186140..7c8d996925 100644
 --- a/dom/media/ExternalEngineStateMachine.h
 +++ b/dom/media/ExternalEngineStateMachine.h
 @@ -8,6 +8,7 @@
@@ -167,7 +167,7 @@ index 17f7186140..112cb9bd17 100644
    ExternalEngineStateMachine* const MOZ_NON_OWNING_REF mOwner;
  };
 diff --git a/dom/media/MediaDecoder.cpp b/dom/media/MediaDecoder.cpp
-index 37ba39bf01..3e3f4467f3 100644
+index 37ba39bf01..bbb36405f4 100644
 --- a/dom/media/MediaDecoder.cpp
 +++ b/dom/media/MediaDecoder.cpp
 @@ -379,9 +379,21 @@ bool MediaDecoder::IsVideoDecodingSuspended() const {
@@ -234,7 +234,7 @@ index 37ba39bf01..3e3f4467f3 100644
      mDecoderStateMachine->DispatchSetPlaybackRate(mPlaybackRate);
    }
 diff --git a/dom/media/MediaDecoder.h b/dom/media/MediaDecoder.h
-index 98d4e9bffc..3a4757d940 100644
+index 98d4e9bffc..c9fd3020eb 100644
 --- a/dom/media/MediaDecoder.h
 +++ b/dom/media/MediaDecoder.h
 @@ -385,6 +385,12 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
@@ -318,6 +318,56 @@ index ac3066049e..195a7bae09 100644
    virtual void SetCanPlayThrough(bool aCanPlayThrough) = 0;
    virtual void SetFragmentEndTime(const media::TimeUnit& aFragmentEndTime) = 0;
  
+diff --git a/dom/media/eme/KeySystemConfig.cpp b/dom/media/eme/KeySystemConfig.cpp
+index e812f981e9..cef267a163 100644
+--- a/dom/media/eme/KeySystemConfig.cpp
++++ b/dom/media/eme/KeySystemConfig.cpp
+@@ -11,6 +11,9 @@
+ #include "mozilla/dom/ChromeUtilsBinding.h"
+ #include "mozilla/dom/Promise.h"
+ #include "nsPrintfCString.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ 
+ #ifdef XP_WIN
+ #  include "PDMFactory.h"
+@@ -136,6 +139,16 @@ bool KeySystemConfig::Supports(const nsAString& aKeySystem) {
+   config->mAudioRobustness.AppendElement(u"SW_SECURE_CRYPTO"_ns);
+   config->mVideoRobustness.AppendElement(u"SW_SECURE_CRYPTO"_ns);
+   config->mVideoRobustness.AppendElement(u"SW_SECURE_DECODE"_ns);
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // The TV's CDM decrypts in its TEE and the pipeline decodes on the
++  // secure video path, which is what these levels promise.
++  if (WebOSEngine::IsAvailable()) {
++    config->mAudioRobustness.AppendElement(u"HW_SECURE_CRYPTO"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_CRYPTO"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_DECODE"_ns);
++    config->mVideoRobustness.AppendElement(u"HW_SECURE_ALL"_ns);
++  }
++#endif
+ 
+ #if defined(MOZ_WIDGET_ANDROID)
+   // MediaDrm.isCryptoSchemeSupported only allows passing
+diff --git a/dom/media/gmp/ChromiumCDMChild.cpp b/dom/media/gmp/ChromiumCDMChild.cpp
+index ed766b39bc..a969eb0baf 100644
+--- a/dom/media/gmp/ChromiumCDMChild.cpp
++++ b/dom/media/gmp/ChromiumCDMChild.cpp
+@@ -474,8 +474,14 @@ mozilla::ipc::IPCResult ChromiumCDMChild::RecvInit(
+     // Once the CDM is initialized we expect it to resolve mInitPromise via
+     // ChromiumCDMChild::OnInitialized
+     mCDM->Initialize(aAllowDistinctiveIdentifier, aAllowPersistentState,
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++                     // The TV's CDM decrypts into the pipeline's secure
++                     // video path, which it treats as a secure codec.
++                     true);
++#else
+                      // We do not yet support hardware secure codecs
+                      false);
++#endif
+   } else {
+     GMP_LOG_DEBUG(
+         "ChromiumCDMChild::RecvInit() mCDM not set! Is GMP shutting down?");
 diff --git a/dom/media/ipc/RemoteDecoderModule.cpp b/dom/media/ipc/RemoteDecoderModule.cpp
 index fff184abf1..1e06524c21 100644
 --- a/dom/media/ipc/RemoteDecoderModule.cpp
@@ -356,7 +406,7 @@ index 69922d2c5a..92a4717573 100644
    MOZ_ASSERT(aDecoder);  // Use ShutdownDecoder() to clear.
    if (mDecoder) {
 diff --git a/dom/media/mediaelement/HTMLMediaElement.h b/dom/media/mediaelement/HTMLMediaElement.h
-index 74ec5b5edf..f4de51d00b 100644
+index 74ec5b5edf..948b5991cd 100644
 --- a/dom/media/mediaelement/HTMLMediaElement.h
 +++ b/dom/media/mediaelement/HTMLMediaElement.h
 @@ -907,6 +907,14 @@ class HTMLMediaElement : public nsGenericHTMLElement,
@@ -374,8 +424,36 @@ index 74ec5b5edf..f4de51d00b 100644
    void PlayInternal(bool aHandlingUserInput);
  
    // See spec, https://html.spec.whatwg.org/#internal-pause-steps
+diff --git a/dom/media/mediasource/MediaSource.cpp b/dom/media/mediasource/MediaSource.cpp
+index e7abc7bcd6..5566c96d7c 100644
+--- a/dom/media/mediasource/MediaSource.cpp
++++ b/dom/media/mediasource/MediaSource.cpp
+@@ -13,6 +13,9 @@
+ #include "MediaSourceDemuxer.h"
+ #include "SourceBuffer.h"
+ #include "SourceBufferList.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/FloatingPoint.h"
+ #include "mozilla/Logging.h"
+@@ -148,6 +151,13 @@ void MediaSource::IsTypeSupported(const nsAString& aType,
+ 
+   bool hasVP9 = false;
+   const MediaCodecs& codecs = containerType->ExtendedType().Codecs();
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // Media Source streams play on the TV's pipeline, so a site must pick
++  // codecs it has (YouTube otherwise chooses Opus and ends up in software).
++  if (WebOSEngine::IsAvailable() && !WebOSEngine::SupportsCodecs(codecs)) {
++    return aRv.ThrowNotSupportedError("Can't play type");
++  }
++#endif
+   for (const auto& codec : codecs.Range()) {
+     if (IsVP9CodecString(codec)) {
+       hasVP9 = true;
 diff --git a/dom/media/mediasource/MediaSourceDecoder.cpp b/dom/media/mediasource/MediaSourceDecoder.cpp
-index ee40a73fd4..e941f17fad 100644
+index ee40a73fd4..3917666011 100644
 --- a/dom/media/mediasource/MediaSourceDecoder.cpp
 +++ b/dom/media/mediasource/MediaSourceDecoder.cpp
 @@ -2,6 +2,9 @@
@@ -388,20 +466,21 @@ index ee40a73fd4..e941f17fad 100644
  
  #include <algorithm>
  
-@@ -85,6 +88,12 @@ MediaSourceDecoder::CreateStateMachine(bool aDisableExternalEngine) {
+@@ -85,6 +88,13 @@ MediaSourceDecoder::CreateStateMachine(bool aDisableExternalEngine) {
        !aDisableExternalEngine) {
      return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
    }
 +#endif
 +#ifdef MOZ_WEBOS_MEDIA_ENGINE
-+  // Encrypted media is refused by the engine once the metadata is known.
++  // Encrypted media plays here too: the CDM wraps its samples for the
++  // pipeline's secure video path.
 +  if (WebOSEngine::IsAvailable() && !aDisableExternalEngine) {
 +    return MakeAndAddRef<ExternalEngineStateMachine>(this, mReader);
 +  }
  #endif
    return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
  }
-@@ -391,7 +400,7 @@ bool MediaSourceDecoder::HadCrossOriginRedirects() {
+@@ -391,7 +401,7 @@ bool MediaSourceDecoder::HadCrossOriginRedirects() {
    return false;
  }
  
@@ -424,7 +503,7 @@ index 1cf21c1f21..eafa8b902a 100644
                        MediaDecoderEventVisibility aEventVisibility) override;
  #endif
 diff --git a/dom/media/platforms/PDMFactory.cpp b/dom/media/platforms/PDMFactory.cpp
-index 6af74f901d..5fca8e771d 100644
+index 6af74f901d..3d914706f5 100644
 --- a/dom/media/platforms/PDMFactory.cpp
 +++ b/dom/media/platforms/PDMFactory.cpp
 @@ -44,6 +44,9 @@
@@ -449,6 +528,71 @@ index 6af74f901d..5fca8e771d 100644
    if (StaticPrefs::media_gpu_process_decoder()) {
      StartupPDM(RemoteDecoderModule::Create(RemoteMediaIn::GpuProcess));
    }
+diff --git a/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp b/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
+index 7cf113956f..720c77fae5 100644
+--- a/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
++++ b/dom/media/platforms/agnostic/eme/EMEDecoderModule.cpp
+@@ -76,12 +76,14 @@ class EMEDecryptor final : public MediaDataDecoder,
+                TrackInfo::TrackType aType,
+                const std::function<MediaEventProducer<TrackInfo::TrackType>*()>&
+                    aOnWaitingForKey,
+-               UniquePtr<ADTSSampleConverter> aConverter = nullptr)
++               UniquePtr<ADTSSampleConverter> aConverter = nullptr,
++               bool aKeepADTS = false)
+       : mDecoder(aDecoder),
+         mProxy(aProxy),
+         mSamplesWaitingForKey(
+             new SamplesWaitingForKey(mProxy, aType, aOnWaitingForKey)),
+         mADTSSampleConverter(std::move(aConverter)),
++        mKeepADTS(aKeepADTS),
+         mIsShutdown(false) {
+     DDLINKCHILD("decoder", mDecoder.get());
+   }
+@@ -169,7 +171,7 @@ class EMEDecryptor final : public MediaDataDecoder,
+       return;
+     }
+ 
+-    if (mADTSSampleConverter &&
++    if (mADTSSampleConverter && !mKeepADTS &&
+         !mADTSSampleConverter->Revert(aDecrypted.mSample)) {
+       mDecodePromise.RejectIfExists(
+           MediaResult(
+@@ -289,6 +291,8 @@ class EMEDecryptor final : public MediaDataDecoder,
+   MozPromiseHolder<FlushPromise> mFlushPromise;
+   MozPromiseRequestHolder<DecodePromise> mDecodeRequest;
+   UniquePtr<ADTSSampleConverter> mADTSSampleConverter;
++  // Leave the ADTS header on the decrypted frame: the decoder wants it.
++  const bool mKeepADTS;
+   bool mIsShutdown;
+ };
+ 
+@@ -477,16 +481,24 @@ EMEDecoderModule::AsyncCreateDecoder(const CreateDecoderParams& aParams) {
+     // See bug 1433344.
+     converter = MakeUnique<ADTSSampleConverter>(aParams.AudioConfig());
+   }
++  bool keepADTS = false;
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // The webOS engine's decoder passes the CDM's output to a pipeline that
++  // takes AAC as ADTS frames, and that output cannot be re-framed anyway:
++  // it is the TV CDM's secure-path wrapping of the sample.
++  keepADTS = aParams.mMediaEngineId.isSome();
++#endif
+ 
+   RefPtr<EMEDecoderModule::CreateDecoderPromise> p =
+       mPDM->CreateDecoder(aParams)->Then(
+           GetCurrentSerialEventTarget(), __func__,
+           [self = RefPtr{this}, params = CreateDecoderParamsForAsync(aParams),
+-           converter = std::move(converter)](
++           converter = std::move(converter), keepADTS](
+               RefPtr<MediaDataDecoder>&& aDecoder) mutable {
+             RefPtr<MediaDataDecoder> emeDecoder(new EMEDecryptor(
+                 aDecoder, self->mProxy, params.mType,
+-                params.mOnWaitingForKeyEvent, std::move(converter)));
++                params.mOnWaitingForKeyEvent, std::move(converter),
++                keepADTS));
+             return EMEDecoderModule::CreateDecoderPromise::CreateAndResolve(
+                 emeDecoder, __func__);
+           },
 diff --git a/dom/media/platforms/moz.build b/dom/media/platforms/moz.build
 index 1bd4af56f2..20f90f83f7 100644
 --- a/dom/media/platforms/moz.build
@@ -475,10 +619,10 @@ index 1bd4af56f2..20f90f83f7 100644
  if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
 diff --git a/dom/media/platforms/webos/WebOSEngine.cpp b/dom/media/platforms/webos/WebOSEngine.cpp
 new file mode 100644
-index 0000000000..dfca0305af
+index 0000000000..2f9d14a41f
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,991 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -553,6 +697,7 @@ index 0000000000..dfca0305af
 +enum { GM_TRACK_VIDEO = 1, GM_TRACK_AUDIO = 2 };
 +enum { GM_VIDEO_H264 = 1, GM_VIDEO_VP9 = 2 };
 +enum { GM_AUDIO_NONE = 0, GM_AUDIO_AAC = 3 };
++enum { GM_PROTECTION_NONE = 0, GM_PROTECTION_WIDEVINE = 1 };
 +enum { GM_OK = 0, GM_RETRY = 1, GM_UNSUPPORTED = 2, GM_ERROR = -1 };
 +enum {
 +  GM_F_PIPELINE = 1,
@@ -569,6 +714,7 @@ index 0000000000..dfca0305af
 +  uint32_t audio_channels;
 +  uint32_t audio_profile;
 +  uint32_t audio_frequency_index;
++  uint32_t protection;
 +  char window_id[128];
 +};
 +
@@ -600,7 +746,7 @@ index 0000000000..dfca0305af
 +
 +/* static */
 +bool WebOSEngine::SupportsFormat(const MediaInfo& aInfo) {
-+  if (!aInfo.HasVideo() || aInfo.IsEncrypted()) {
++  if (!aInfo.HasVideo()) {
 +    return false;
 +  }
 +  const nsCString& v = aInfo.mVideo.mMimeType;
@@ -696,7 +842,8 @@ index 0000000000..dfca0305af
 +      mImage = new layers::SourceSurfaceImage(surface);
 +    }
 +    mInited = true;
-+    LOG("helper %d ready, window %s", int(mPid), mWindowId.get());
++    LOG("helper %d ready, window %s%s", int(mPid), mWindowId.get(),
++        mInfo.IsEncrypted() ? ", protected" : "");
 +    ScheduleTick();
 +    return GenericNonExclusivePromise::CreateAndResolve(true, __func__);
 +  });
@@ -874,6 +1021,8 @@ index 0000000000..dfca0305af
 +  } else {
 +    m.arg[5] = GM_AUDIO_NONE;
 +  }
++  p.protection =
++      mInfo.IsEncrypted() ? GM_PROTECTION_WIDEVINE : GM_PROTECTION_NONE;
 +  snprintf(p.window_id, sizeof p.window_id, "%s", mWindowId.get());
 +  if (!Request(m, &p, sizeof p, kOpenTimeoutMs)) {
 +    LOGW("helper did not answer OPEN");
@@ -1467,10 +1616,10 @@ index 0000000000..dfca0305af
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngine.h b/dom/media/platforms/webos/WebOSEngine.h
 new file mode 100644
-index 0000000000..dbbd1541dc
+index 0000000000..50f568acb2
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.h
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,191 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1536,6 +1685,9 @@ index 0000000000..dbbd1541dc
 +  RefPtr<GenericPromise> Flush(TrackInfo::TrackType aType);
 +
 +  const MediaInfo& Info() const { return mInfo; }
++  // Encrypted media: every sample arrives wrapped by the CDM for the
++  // pipeline's secure video path, audio frames already in ADTS.
++  bool Protected() const { return mInfo.IsEncrypted(); }
 +
 + private:
 +  ~WebOSEngineChannel();
@@ -1616,7 +1768,7 @@ index 0000000000..dbbd1541dc
 +
 +  // True when the launcher set up a helper for this run.
 +  static bool IsAvailable();
-+  // Unencrypted H.264 or VP9 video with no audio or AAC audio.
++  // H.264 or VP9 video with no audio or AAC audio, clear or encrypted.
 +  static bool SupportsFormat(const MediaInfo& aInfo);
 +  // The same codecs, for a Media Source type's codecs list.
 +  static bool SupportsCodecs(const MediaCodecs& aCodecs);
@@ -1643,7 +1795,10 @@ index 0000000000..dbbd1541dc
 +  void NotifyEndOfStream(TrackInfo::TrackType aType) override {
 +    mChannel->NotifyEndOfStream(aType);
 +  }
-+  bool SetCDMProxy(CDMProxy* aProxy) override { return false; }
++  // Encrypted samples reach the pipeline as the TV CDM's secure-path
++  // output. The reader's EME decryptor makes the CDM calls, so the
++  // engine keeps nothing of the proxy.
++  bool SetCDMProxy(CDMProxy* aProxy) override { return true; }
 +  void NotifyResizing(uint32_t aWidth, uint32_t aHeight) override {}
 +  void SetVideoRect(const gfx::IntRect& aRect) override {
 +    mChannel->SetVideoRect(aRect);
@@ -1658,10 +1813,10 @@ index 0000000000..dbbd1541dc
 +#endif  // DOM_MEDIA_PLATFORMS_WEBOS_WEBOSENGINE_H_
 diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
 new file mode 100644
-index 0000000000..44fba424a2
+index 0000000000..6e463df5d4
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.cpp
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,169 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1693,8 +1848,10 @@ index 0000000000..44fba424a2
 +
 +  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override {
 +    RefPtr<MediaRawData> sample = aSample;
-+    if (mInfo->GetType() == TrackInfo::kAudioTrack) {
-+      // The pipeline takes AAC as ADTS frames.
++    if (mInfo->GetType() == TrackInfo::kAudioTrack &&
++        !mChannel->Protected()) {
++      // The pipeline takes AAC as ADTS frames. Encrypted audio was
++      // framed before decryption and is passed through as it comes.
 +      const AudioInfo* audio = mInfo->GetAsAudioInfo();
 +      if (!ADTS::FrameHeader::MatchesSync(Span{sample->Data(), sample->Size()})) {
 +        sample = aSample->Clone();
@@ -1831,7 +1988,7 @@ index 0000000000..44fba424a2
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.h b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
 new file mode 100644
-index 0000000000..c0591f0aa4
+index 0000000000..30904deeb9
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
 @@ -0,0 +1,44 @@
@@ -1949,7 +2106,7 @@ index 41c0092894..a4c2a1b968 100644
                                           const wr::LayoutRect& aClip,
                                           bool aIsBackfaceVisible,
 diff --git a/gfx/webrender_bindings/WebRenderAPI.h b/gfx/webrender_bindings/WebRenderAPI.h
-index 82e9800231..b624ea52f4 100644
+index 82e9800231..398898430f 100644
 --- a/gfx/webrender_bindings/WebRenderAPI.h
 +++ b/gfx/webrender_bindings/WebRenderAPI.h
 @@ -656,6 +656,10 @@ class DisplayListBuilder final {
@@ -1964,7 +2121,7 @@ index 82e9800231..b624ea52f4 100644
                         const wr::LayoutRect& aClip, bool aIsBackfaceVisible,
                         const wr::ColorF& aColor);
 diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
-index a89cc039ea..282a6e727b 100644
+index a89cc039ea..d3c3e53713 100644
 --- a/gfx/webrender_bindings/src/bindings.rs
 +++ b/gfx/webrender_bindings/src/bindings.rs
 @@ -3434,6 +3434,26 @@ pub extern "C" fn wr_dp_push_rect(
@@ -1995,7 +2152,7 @@ index a89cc039ea..282a6e727b 100644
  pub extern "C" fn wr_dp_push_rect_with_animation(
      state: &mut WrState,
 diff --git a/gfx/wr/webrender/src/batch.rs b/gfx/wr/webrender/src/batch.rs
-index 3a15c9f6aa..3f811e2762 100644
+index 3a15c9f6aa..9917e50b52 100644
 --- a/gfx/wr/webrender/src/batch.rs
 +++ b/gfx/wr/webrender/src/batch.rs
 @@ -2,7 +2,7 @@
@@ -2098,7 +2255,7 @@ index 5205194881..a76ff24e96 100644
                          opaque_rect: pic_coverage_rect,
                          spanning_opaque_color: None,
 diff --git a/gfx/wr/webrender_api/src/display_item.rs b/gfx/wr/webrender_api/src/display_item.rs
-index e601a6df4f..bee6c2f2c2 100644
+index e601a6df4f..ff5d74a545 100644
 --- a/gfx/wr/webrender_api/src/display_item.rs
 +++ b/gfx/wr/webrender_api/src/display_item.rs
 @@ -53,6 +53,11 @@ bitflags! {
@@ -2114,7 +2271,7 @@ index e601a6df4f..bee6c2f2c2 100644
  }
  
 diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
-index 32c65b7e56..55432dbefe 100644
+index 32c65b7e56..716c1079ba 100644
 --- a/layout/generic/nsVideoFrame.cpp
 +++ b/layout/generic/nsVideoFrame.cpp
 @@ -620,6 +620,12 @@ class nsDisplayVideo final : public nsPaintedDisplayItem {
@@ -2172,7 +2329,7 @@ index 32c65b7e56..55432dbefe 100644
    // This is tracked by bug 1545498.
  
 diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
-index c00a539cb2..fc5298c279 100644
+index c00a539cb2..5ce88122f6 100644
 --- a/modules/libpref/init/StaticPrefList.yaml
 +++ b/modules/libpref/init/StaticPrefList.yaml
 @@ -12843,6 +12843,25 @@
@@ -2202,7 +2359,7 @@ index c00a539cb2..fc5298c279 100644
    type: bool
    value: false
 diff --git a/toolkit/moz.configure b/toolkit/moz.configure
-index 593f8b9b9c..ebb19e1d52 100644
+index 593f8b9b9c..646252ddb8 100644
 --- a/toolkit/moz.configure
 +++ b/toolkit/moz.configure
 @@ -830,6 +830,16 @@ set_define("MOZ_WMF", wmf)

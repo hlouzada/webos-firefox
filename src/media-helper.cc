@@ -282,16 +282,19 @@ public:
                 c.open.audio_channels < 1 || c.open.audio_channels > 8)
                 return GM_UNSUPPORTED;
         }
+        if (c.open.protection != GM_PROTECTION_NONE && c.open.protection != GM_PROTECTION_WIDEVINE)
+            return GM_UNSUPPORTED;
         if (!valid_window_id(c.open.window_id)) {
             logmsg("window id refused: %s", c.open.window_id);
             c.open.window_id[0] = '\0';
         }
         config_ = c;
         configured_ = true;
-        logmsg("open: video %s %dx%d %d/%d fps, audio %s, window %s",
+        logmsg("open: video %s %dx%d %d/%d fps, audio %s, window %s%s",
                c.vcodec == GM_VIDEO_H264 ? "H264" : "VP9", c.width, c.height, c.fps_num, c.fps_den,
                c.acodec == GM_AUDIO_AAC ? "AAC" : "none",
-               c.open.window_id[0] ? c.open.window_id : "none");
+               c.open.window_id[0] ? c.open.window_id : "none",
+               c.open.protection == GM_PROTECTION_WIDEVINE ? ", Widevine" : "");
         if (!c.open.window_id[0])
             logmsg("no exported window id: the picture has no place on screen");
         return GM_OK;
@@ -581,6 +584,17 @@ private:
         unsigned generation;
     };
 
+    /* Secure video path format the pipeline expects the CDM's output in: 40
+     * from webOS 5 on, 30 before (the values Kodi's webOS player uses).
+     * GECKOTV_SVP_VERSION overrides. */
+    static int SvpVersion()
+    {
+        const char *env = getenv("GECKOTV_SVP_VERSION");
+        int v = env && env[0] ? atoi(env) : 0;
+
+        return v > 0 && v < 100 ? v : 40;
+    }
+
     std::string LoadPayload(int64_t time_us) const
     {
         const Config &c = config_;
@@ -600,7 +614,14 @@ private:
             snprintf(buf, sizeof buf, "\"windowId\":\"%s\",", c.open.window_id);
             s += buf;
         }
-        s += "\"queryPosition\":false,\"externalStreamingInfo\":{\"contents\":{\"format\":\"RAW\","
+        if (c.open.protection == GM_PROTECTION_WIDEVINE)
+            s += "\"drm\":{\"type\":\"WIDEVINE_MODULAR\"},";
+        s += "\"queryPosition\":false,\"externalStreamingInfo\":{";
+        if (c.open.protection == GM_PROTECTION_WIDEVINE) {
+            snprintf(buf, sizeof buf, "\"svpVersion\":%d,", SvpVersion());
+            s += buf;
+        }
+        s += "\"contents\":{\"format\":\"RAW\","
              "\"provider\":\"Firefox\",\"codec\":{";
         snprintf(buf, sizeof buf, "\"video\":\"%s\"", c.vcodec == GM_VIDEO_H264 ? "H264" : "VP9");
         s += buf;

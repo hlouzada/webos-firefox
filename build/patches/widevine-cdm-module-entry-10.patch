@@ -1,0 +1,30 @@
+diff --git a/dom/media/gmp/ChromiumCDMAdapter.cpp b/dom/media/gmp/ChromiumCDMAdapter.cpp
+--- a/dom/media/gmp/ChromiumCDMAdapter.cpp
++++ b/dom/media/gmp/ChromiumCDMAdapter.cpp
+@@ -100,14 +100,24 @@ GMPErr ChromiumCDMAdapter::GMPInit(const GMPPlatformAPI* aPlatformAPI) {
+   }
+ #endif
+ 
++  // LG's Widevine wrapper on webOS TVs (libwvcdm_shared.so) names the module
++  // entry point after the CDM interface it implements, InitializeCdmModule_10,
++  // while taking no arguments like InitializeCdmModule_4. Its
++  // CreateCdmInstance has the stock signature.
++  const char* initName = MOZ_STRINGIFY(INITIALIZE_CDM_MODULE);
+   auto init = reinterpret_cast<decltype(::INITIALIZE_CDM_MODULE)*>(
+-      PR_FindFunctionSymbol(mLib, MOZ_STRINGIFY(INITIALIZE_CDM_MODULE)));
++      PR_FindFunctionSymbol(mLib, initName));
++  if (!init) {
++    initName = "InitializeCdmModule_10";
++    init = reinterpret_cast<decltype(::INITIALIZE_CDM_MODULE)*>(
++        PR_FindFunctionSymbol(mLib, initName));
++  }
+   if (!init) {
+     MOZ_CRASH("Missing init method!");
+     return GMPGenericErr;
+   }
+ 
+-  GMP_LOG_DEBUG(MOZ_STRINGIFY(INITIALIZE_CDM_MODULE) "()");
++  GMP_LOG_DEBUG("{}()", initName);
+   init();
+ 
+   return GMPNoErr;

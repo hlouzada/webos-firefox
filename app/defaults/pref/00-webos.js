@@ -139,6 +139,17 @@ pref("dom.push.connection.enabled", false);
 pref("media.gmp-manager.updateEnabled", false);
 pref("media.gmp-provider.enabled", false);
 pref("media.gmp-gmpopenh264.enabled", false);
+// Widevine through the TV's own CDM, which the launcher hands to Firefox in
+// MOZ_GMP_PATH when hardware video is on (findings.md section 24). Linux
+// builds leave EME off by default. The CDM only decrypts into the TV's
+// secure video path, so the platform decoder (the webOS engine) must take
+// its output rather than the CDM's own decoder.
+pref("media.eme.enabled", true);
+pref("media.gmp-widevinecdm.visible", true);
+pref("media.gmp-widevinecdm.enabled", true);
+pref("media.gmp-widevinecdm.autoupdate", false);
+pref("media.gmp-widevinecdm.allow-chromium-update", false);
+pref("media.eme.video.prefer-platform-decoder", true);
 pref("browser.search.update", false);
 pref("browser.search.suggest.enabled", false);
 pref("browser.urlbar.suggest.searches", false);

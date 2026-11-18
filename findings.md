@@ -1643,7 +1643,7 @@ this TV) fires while the Magic Remote cursor is hidden and closes every
 window in the OVERLAY view with reason `userTimeout`, along with the
 on-screen keyboard, Home and alerts. The timer restarts on key presses the
 compositor sees, on cursor show and hide, and on notifications. Wheel
-notches never reach it (section 26's mask), and pointer motion with the
+notches never reach it (section 27's mask), and pointer motion with the
 cursor already shown does not count, so reading a page or watching a video
 for two minutes was enough. The adapter's pop-up overlay in GL mode is a
 second toplevel of the app, and it was typed `_WEBOS_WINDOW_TYPE_OVERLAY`.
@@ -1684,7 +1684,163 @@ two minutes. The handler exempts an overlay with appId
 
 ---
 
-## 24. Why pages felt slow on webOS 6.5, and what was cut (2026-11-17)
+## 24. Widevine through the TV's own CDM (2026-11-18)
+
+Google builds Widevine for Firefox on x86, x86_64 and 64-bit Windows and
+macOS only, and Firefox's configure (`eme_choices` in
+`toolkit/moz.configure`) leaves EME out of an ARM build. The TV has a
+Widevine of its own, and it is the only one that can run here: the
+userspace is 32-bit ARM with the soft-float calling convention, which no
+other Widevine binary uses.
+
+**What the TV ships (webOS 6.5.3, Chromium 79 in `libcbe.so`).**
+`/usr/lib/libwvcdm_shared.so.16.3.0.0` is LG's wrapper around Widevine CE
+CDM 16.3 (`libwidevine_ce_cdm_shared.so`). Its exports are the Chromium CDM
+module entry points: `CreateCdmInstance`, `DeinitializeCdmModule`,
+`GetCdmVersion` and `InitializeCdmModule_10`. The disassembly shows
+`CreateCdmInstance` with the stock five arguments; it accepts interface
+version 10 only and asks the host for a `Host_10`. `InitializeCdmModule_10`
+takes no arguments. Firefox's `ChromiumCDMAdapter` speaks interfaces 10 and
+11 and looks the module up as `InitializeCdmModule_4`; the TV's browser
+looks up the `_10` name. Both libraries carry the soft-float ABI flag, the
+same as this build. The TEE is reached through `libkadaptor.so` (a MediaTek
+adaptor over `/dev/tee0` and friends, all world-accessible), with no Luna
+service in between, so the app's user can use it. Kodi's webOS player and
+its `inputstream.adaptive` add-on load the same library the same way.
+
+**The catch.** `Decrypt` does not return clear data. It returns an "SVP
+inband" stream (`libsvp_inband_serializer.so`): the sample wrapped for the
+secure video path, which `libwvmd_decryptor.so` in the pipeline unwraps and
+decrypts inside the TEE (`DILE_SVP_WidevineDecryptCENC_V16`). The pipeline
+takes such samples when its Load option carries
+`externalStreamingInfo.svpVersion` (40 from webOS 5 on, 30 before) and
+`drm.type` `WIDEVINE_MODULAR`, the values Kodi uses. Every sample of a
+protected stream goes through the CDM, clear ones included, so the pipeline
+sees one format. Protected video therefore plays only on the Starfish path
+(webOS 5 and 6 in GL window mode), and the launcher offers Widevine only
+while hardware video is on.
+
+**How it is wired.**
+
+- `eme-widevine-arm.patch` lets configure accept `--enable-eme=widevine`
+  on ARM; that flag only sets the Widevine prefs in `firefox.js`.
+- `widevine-cdm-module-entry-10.patch` makes the adapter fall back to the
+  `InitializeCdmModule_10` name.
+- The launcher writes `<profile>/gmp/gmp-widevinecdm/<version>/` with a
+  Chromium-style `manifest.json` (name `WidevineCdm`, module 4, interface
+  10, host 10) and `libwidevinecdm.so` as a link to the TV's library, and
+  sets `MOZ_GMP_PATH` to it. The version is the suffix of the library's
+  real name, so a firmware update gets a fresh directory. The plugin
+  process already runs without the seccomp sandbox
+  (`MOZ_DISABLE_GMP_SANDBOX=1`), which the TEE device access needs.
+- `00-webos.js` turns EME on (Linux builds leave it off), shows and
+  enables the Widevine plugin, and sets
+  `media.eme.video.prefer-platform-decoder`, so Firefox decrypts with the
+  CDM and decodes with the webOS engine instead of asking the CDM to
+  decode.
+- In the engine patch, `WebOSEngine::SupportsFormat` accepts encrypted
+  media and `SetCDMProxy` says yes without keeping the proxy: the reader's
+  `EMEDecryptor` makes the CDM calls. Firefox's `MediaChangeMonitor` wraps
+  that decryptor from the outside, so the AVCC to Annex B conversion runs
+  before decryption and the CDM sees the adjusted subsample sizes. The
+  `gm_open` payload gained a `protection` field; the helper then adds
+  `svpVersion` (`GECKOTV_SVP_VERSION` overrides) and the drm type to its
+  Load payload. Encrypted AAC is ADTS-framed before decryption by Firefox's
+  own converter, and on webOS the header stays on afterwards (the CDM's
+  output cannot be re-framed), so the engine's stream passes protected
+  audio through untouched. `ChromiumCDMChild` initializes the CDM with
+  hardware-secure codecs on webOS, as Kodi does. `KeySystemConfig` adds the
+  `HW_SECURE_*` robustness levels while the engine is available, since the
+  TEE and the secure video path are what those levels mean.
+- The committed engine patch had lost its `MediaSource.cpp` hunk
+  (`isTypeSupported` refusing codecs the pipeline lacks); it is back.
+
+**Host checks.** `tests/media-helper/run.sh` opens a Widevine stream and
+checks the Load payload for the drm type and `svpVersion`, the override,
+and that a clear stream carries neither; an unknown protection value is
+refused. These checks fail against the previous helper.
+
+**On the TV (webOS 6.5, 2026-11-18).** The plugin registers (`com.widevine.alpha`
+with `vp8`, `vp9`, `h264` tags), `requestMediaKeySystemAccess` resolves, the
+plugin process loads the TV library through `InitializeCdmModule_10` and
+`CreateCdmInstance` answers for interface 10. `Initialize` then reports
+failure, and sites show `DRM_MEDIA_KEY_INITIALIZATION_FAILED`. A probe that
+loads the library the same way (`experiments/widevine-probe/`) shows why:
+outside the app jail the CDM logs `TEEC_OpenSession success` and
+`OnInitialized(true)`, writing the device certificate to its storage
+directory; inside the jail (`chroot` into `/var/palm/jail/<app id>`) no TEE
+session opens and it answers `OnInitialized(false)`. The storage directory
+is `/tmp/<basename of $HOME>_ce_cdm/` and is created fine in the jail. With
+`/dev/tee0` (character device 253,0) added to the jail's `/dev` for the
+probe, it initializes inside the jail too; the node was removed afterwards.
+
+The jail of a Developer Mode app comes from `/etc/jail_native_devmode.conf`,
+which copies no TEE node on this MediaTek TV (it does for Realtek models).
+The jails of LG's browser, Netflix, Amazon and YouTube carry `tee0`. The
+manifest field `privilegedJail` ("a native app can be launched with
+native_builtin jail configuration", whose MediaTek branch copies `tee0`) was
+tried in a clean install of 0.1.51: the app manager reports it as true in
+`getAppInfo`, but still launches the app with `jailer_type` `native_devmode`;
+the app's directory type (dev) decides. So without changing system files
+there is no Widevine on this firmware. The launcher checks for `/dev/tee0`
+and, when it is missing, leaves `MOZ_GMP_PATH` unset, so the key system is
+reported unsupported instead of failing at initialization. The wrapper's own
+log lines go to the PmLog context `widevine-modular` and never reached
+`/var/log/messages` from the plugin process.
+
+**The pipeline-side route, checked (2026-11-18, same TV).** The remaining
+idea was to let the media pipeline, which runs as root outside the jail, do
+the Widevine work itself through `StarfishMediaAPIs::setDrmOperation` and
+the `drmEncrypted` event. The firmware does not implement it for Widevine.
+`setDrmOperation(systemId, drmData, drmMsgType, service, kid, sessionId,
+requestId)` in `libpf-1.0.so` only builds a `GstContext` named
+`drm-operation` with those fields and sets it on the GStreamer pipeline
+(disassembly: `gst_context_new`, `gst_structure_set`,
+`gst_element_set_context`, nothing else). No GStreamer plugin on the TV reads
+that context; the only other binary with the string is the broadcast
+recording player (`libadvr-factory.so`). The `drm-encrypted` bus message
+that `handleDrmEncryptedMessage` turns into the `drmEncrypted` event is
+posted by no element present either. The CENC decryptors in
+`/usr/lib/gstreamer-1.0` are `cencdrmplayready`, `cencdrmmarlin`,
+`cencdrmuhdcp` and `ckdrm` (ClearKey); the DASH player's code refers to a
+`cencdrmwidevine` element, but `gst-inspect-1.0 cencdrmwidevine` answers
+"No such element or plugin" and no file with widevine in its name exists
+outside the two CDM libraries. `libgstbasedrm` acquires licenses only for
+those elements (PlayReady over its own HTTP client with the `dashif:Laurl`).
+The DRM agent (`/usr/sbin/drm`, `com.webos.service.drm`) accepts `drmType`
+`playready` and `widevine` with `msgType`
+`application/vnd.ms-playready.initiator+xml` or `application/widevine+xml`,
+which is Widevine Classic (keybox, `libWVStreamControlAPI.so`), not Modular.
+For Widevine Modular the pipeline has exactly one piece, the
+`adaptivedecryptor` element with `drmtype` `widevine-modular`, which loads
+`drmdecryptor/libwvmd_decryptor.so` and unwraps the SVP inband data a CDM
+produced in the client process. LG's browser does it that way too:
+`libcbe.so` contains `wvcdm_shared`, `InitializeCdmModule_10`,
+`WIDEVINE_MODULAR` and `svpVersion`, the same wiring this project uses. So
+the CDM must run in the app's process tree, and on webOS 6.5 that process
+needs `/dev/tee0`, which a Developer Mode jail does not get. The current
+structure stays as the documented path for firmware whose jail has the node.
+
+**Why LG's apps have the node and a Developer Mode app cannot get it.** The
+app manager's source (webOS OSE `sam`, `NativeContainer.cpp`) picks the jail:
+an app whose location is the developer directory is always launched with
+`native_devmode`; only for store-installed apps (`/media/cryptofs`) does
+`privilegedJail: true` select the `native_mvpd` jail. Netflix, Amazon and
+YouTube are LG-signed store packages with that field; the installer verifies
+the signature (`VerifyIpk`, `VerifyAppSigning` in `appinstalld`), and LG's
+Seller Lounge accepts only web apps from third parties. The two root-only
+switches are `/var/luna/preferences/jailer_disabled` and the `NoJailApps`
+list in `sam-conf.json`. Other projects: Kodi's webOS player and
+`inputstream.adaptive` load the same TV library in-process, and secondary
+sources say Kodi 22's Widevine works on webOS 8 and later; `webos-drm-bridge`
+does the same from a native service of a Developer Mode package on webOS 25.
+Both suggest that newer firmware lets a Developer Mode process reach the TEE;
+the webOS 6.5 jail does not. The launcher's `widevine on` / `widevine off (no
+/dev/tee0 in this jail)` line answers that question for any TV without root.
+
+---
+
+## 25. Why pages felt slow on webOS 6.5, and what was cut (2026-11-17)
 
 Measured on the webOS 6.5 TV (`findings.md` section 19's device) with the
 0.1.46 runtime, before any change in this round.
@@ -1844,7 +2000,7 @@ xkbcommon's keymap errors. The log file itself still grows without bound.
 
 ---
 
-## 25. Fixed: the remote's Back key did nothing but close the keyboard
+## 26. Fixed: the remote's Back key did nothing but close the keyboard
 
 The compositor delivers Back to the app as a wl_keyboard key. The key is
 412 (`KEY_PREVIOUS`) on webOS 6.5 and 158 (`KEY_BACK`) on the TVs the
@@ -1876,7 +2032,7 @@ The three cases are these.
 
 ---
 
-## 26. Fixed: one wheel notch scrolled six times too far, and the page was too small
+## 27. Fixed: one wheel notch scrolled six times too far, and the page was too small
 
 A Magic Remote notch reaches GTK as the adapter's own `wl_pointer.axis`
 event (section 3c), and the adapter sent an axis value of 60 per notch. GTK

@@ -598,8 +598,6 @@ int main(int argc, char **argv)
             args[narg++] = argv[i];
     } else if (argc > 1 && launch_target(argv[1], target, sizeof target)) {
         args[narg++] = target;
-    } else {
-        args[narg++] = "https://example.com";
     }
     args[narg] = NULL;
     /* Drop the Magic Remote wheel on the compositor so it scrolls this

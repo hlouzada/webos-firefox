@@ -1,9 +1,9 @@
 /* Host test of GL window mode's GPU pop-ups. A pop-up content surface that
- * commits a buffer not from this process's wl_shm becomes a window of its
- * own, is hit by rectangle, follows its pop-up, and survives Firefox's
- * destroy hidden. Built by run.sh with the whole adapter included. The
- * proxies live on a wl_display over a socketpair nobody reads, so requests
- * marshal without a compositor. */
+ * commits a buffer not from this process's wl_shm borrows the overlay's
+ * window for its buffers, is hit by rectangle, follows its pop-up, and
+ * gives the window back when hidden or destroyed. Built by run.sh with the
+ * whole adapter included. The proxies live on a wl_display over a
+ * socketpair nobody reads, so requests marshal without a compositor. */
 #include "../../src/webos-xdg.c"
 
 static int failures;
@@ -42,7 +42,7 @@ int main(void)
     int sv[2];
     struct wl_display *display;
     struct wl_proxy *compositor, *popup, *popup2, *child, *child2, *gpu_buf, *gpu_buf2, *shm_buf;
-    struct wl_proxy *buffer;
+    union wl_argument damage[4];
     struct wl_surface *hit;
     int32_t ox, oy;
 
@@ -69,6 +69,20 @@ int main(void)
     gpu_buf2 = wl_proxy_create(compositor, &wl_buffer_interface);
     shm_buf = wl_proxy_create(compositor, &wl_buffer_interface);
     ov_bufs[0].proxy = shm_buf;     /* a buffer of this process's wl_shm */
+    /* The overlay window, as ov_ensure would have made it. */
+    ov_compositor = (struct wl_compositor *)compositor;
+    ov_surface = (struct wl_surface *)wl_proxy_create(compositor, &wl_surface_interface);
+    ov_w = win_w;
+    ov_h = win_h;
+    ov_canvas = calloc((size_t)ov_w * (size_t)ov_h, 4);
+    ov_buffer[0] = (struct wl_buffer *)wl_proxy_create(compositor, &wl_buffer_interface);
+    ov_buffer[1] = (struct wl_buffer *)wl_proxy_create(compositor, &wl_buffer_interface);
+    ov_mem[0] = calloc((size_t)ov_w * (size_t)ov_h, 4);
+    ov_mem[1] = calloc((size_t)ov_w * (size_t)ov_h, 4);
+    ov_free[0] = ov_free[1] = 1;
+    ov_shown = 1;
+    damage[0].i = damage[1].i = 0;
+    damage[2].i = damage[3].i = 10;
 
     CHECK(gl_mode() && flat_mode(), "GL window mode on a flat-mode compositor");
 
@@ -78,15 +92,18 @@ int main(void)
     ov_popup_at(popup, 1434, 76);
     CHECK(ov_item_find(child) && !gp_find(child), "a content surface starts in the overlay");
 
-    /* Its first buffer is not shared memory, so it gets a window of its own. */
-    buffer = gpu_buf;
-    gp_attach(child, &buffer);
-    CHECK(gp_find(child) && !ov_item_find(child) && buffer == gpu_buf,
-          "a GPU buffer promotes it out of the overlay, the buffer attached as is");
+    /* Its first buffer is not shared memory, so it goes to the overlay's window. */
+    CHECK(gp_attach(child, gpu_buf) == 1 && gp_find(child) && !ov_item_find(child) &&
+              gp_find(child)->shown && gp_showing(),
+          "a GPU buffer promotes it out of the overlay and onto the window");
     CHECK(gp_find(child)->popup == popup && gp_find(child)->x == 1434 &&
               gp_find(child)->y == 76 && gp_find(child)->w == 446 && gp_find(child)->h == 286,
           "placed where the pop-up is, with the pop-up's size");
-    CHECK(shelled_slot(child) >= 0, "it has a wl_shell role");
+    CHECK(shelled_slot(child) < 0, "it gets no role of its own");
+    CHECK(gp_request(child, WL_SURFACE_DAMAGE, damage) == 1 &&
+              gp_request(child, WL_SURFACE_COMMIT, NULL) == 1,
+          "its damage and commit are taken for the window");
+    CHECK(gp_request(popup, WL_SURFACE_COMMIT, NULL) == 0, "another surface's commit goes out");
     CHECK(gp_input_popup(child, &ox, &oy) == popup && ox == 0 && oy == 0,
           "input on it belongs to GTK's pop-up surface");
     CHECK(input_surface((struct wl_surface *)child) == main_surface,
@@ -100,16 +117,13 @@ int main(void)
 
     /* A shared-memory content surface stays in the overlay. */
     ov_child(child2, popup);
-    buffer = shm_buf;
-    gp_attach(child2, &buffer);
-    CHECK(ov_item_find(child2) && !gp_find(child2),
+    CHECK(gp_attach(child2, shm_buf) == 0 && ov_item_find(child2) && !gp_find(child2),
           "a shared-memory buffer keeps a content surface in the overlay");
 
     /* Firefox hides the pop-up by attaching nothing. */
-    buffer = NULL;
-    gp_attach(child, &buffer);
-    CHECK(buffer != NULL && buffer == (struct wl_proxy *)gp_blank && !gp_find(child)->shown,
-          "attaching nothing attaches the transparent buffer instead");
+    CHECK(gp_attach(child, NULL) == 1 && !gp_find(child)->shown && !gp_showing(),
+          "attaching nothing hides it and gives the window back");
+    CHECK(gp_request(child, WL_SURFACE_COMMIT, NULL) == 1, "its commits are still taken");
     CHECK(ov_hit(1500, 100, &ox, &oy) == NULL, "hidden, it takes no clicks");
 
     /* Shown again in a new pop-up surface of GTK's, at another place. */
@@ -117,10 +131,9 @@ int main(void)
           "shown again, it belongs to the new pop-up surface");
     add_popup(popup2, 300, 200);
     ov_popup_at(popup2, 10, 20);
-    buffer = gpu_buf2;
-    gp_attach(child, &buffer);
-    CHECK(gp_find(child)->x == 10 && gp_find(child)->y == 20 && gp_find(child)->w == 300 &&
-              gp_find(child)->h == 200 && buffer == gpu_buf2,
+    CHECK(gp_attach(child, gpu_buf2) == 1 && gp_find(child)->x == 10 &&
+              gp_find(child)->y == 20 && gp_find(child)->w == 300 && gp_find(child)->h == 200 &&
+              gp_find(child)->shown,
           "it follows the new pop-up's place and size");
     hit = ov_hit(100, 100, &ox, &oy);
     CHECK(hit == (struct wl_surface *)popup2 && ox == 10 && oy == 20, "and takes clicks there");
@@ -136,24 +149,21 @@ int main(void)
         struct wl_proxy *child3 = wl_proxy_create(compositor, &wl_surface_interface);
 
         ov_child(child3, win2);
-        buffer = gpu_buf;
-        gp_attach(child3, &buffer);
-        CHECK(!gp_find(child3) && ov_item_find(child3),
+        CHECK(gp_attach(child3, gpu_buf) == 0 && !gp_find(child3) && ov_item_find(child3),
               "a GPU buffer under a non-pop-up surface promotes nothing");
     }
 
     /* Where the compositor shows the window decides the click rectangle. */
     setenv("WEBOS_XDG_GPU_POPUP_PLACED", "topleft", 1);
-    gp_find(child)->placed = 0;
     gp_place(gp_find(child));
     CHECK(gp_find(child)->px == 0 && gp_find(child)->py == 0,
           "by default the window is taken to be at the top left");
     CHECK(ov_hit(100, 100, &ox, &oy) == (struct wl_surface *)popup2 && ox == -5 && oy == -7,
           "a click at the top left lands on the pop-up, origin minus the content offset");
-    gp_webos_position(gp_find(child), NULL, 500, 400);
+    gp_window_moved(NULL, NULL, 500, 400);
     CHECK(gp_find(child)->px == 500 && ov_hit(100, 100, &ox, &oy) == NULL &&
               ov_hit(510, 410, &ox, &oy) == (struct wl_surface *)popup2 && ox == 495,
-          "position_changed moves the click rectangle");
+          "the window's position_changed moves the click rectangle");
 
     /* The synthetic pointer focus follows clicks into a pop-up. It must not
      * outlive the pop-up's surface because a leave for it would be a use
@@ -170,11 +180,13 @@ int main(void)
         CHECK(synth_focus == NULL, "destroying the focused wl_surface drops the focus");
     }
 
-    /* Firefox destroys the surface. It is kept and hidden. */
-    CHECK(gp_destroy(child) == 1 && gp_find(child)->gone && !gp_find(child)->shown,
-          "destroy is swallowed and the surface kept hidden");
+    /* Firefox destroys the surface while it shows: the window is given back. */
+    CHECK(gp_attach(child, gpu_buf2) == 1 && gp_showing(), "shown again before the destroy");
+    gp_destroy(child);
+    CHECK(!gp_find(child) && !gp_showing(), "destroy drops it and gives the window back");
     CHECK(gp_reparent(child, popup) == 0, "a destroyed one is not shown again");
-    CHECK(gp_destroy(child2) == 0, "destroy of an overlay surface goes out");
+    gp_destroy(child2);
+    CHECK(ov_item_find(child2), "destroy of an overlay surface changes nothing here");
 
     printf("%d failure(s)\n", failures);
     return failures ? 1 : 0;

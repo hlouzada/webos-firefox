@@ -25,7 +25,7 @@ index c9b799cf07..30ef7d48f9 100644
    return MakeAndAddRef<MediaDecoderStateMachine>(this, mReader);
  }
 diff --git a/dom/media/ExternalEngineStateMachine.cpp b/dom/media/ExternalEngineStateMachine.cpp
-index 2b0ef73252..d8871f85eb 100644
+index 2b0ef73252..bd14105a5c 100644
 --- a/dom/media/ExternalEngineStateMachine.cpp
 +++ b/dom/media/ExternalEngineStateMachine.cpp
 @@ -13,6 +13,9 @@
@@ -122,7 +122,7 @@ index 2b0ef73252..d8871f85eb 100644
    if (aError != NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA ||
        aError != NS_ERROR_DOM_MEDIA_CANCELED) {
 diff --git a/dom/media/ExternalEngineStateMachine.h b/dom/media/ExternalEngineStateMachine.h
-index 17f7186140..112cb9bd17 100644
+index 17f7186140..7c8d996925 100644
 --- a/dom/media/ExternalEngineStateMachine.h
 +++ b/dom/media/ExternalEngineStateMachine.h
 @@ -8,6 +8,7 @@
@@ -167,7 +167,7 @@ index 17f7186140..112cb9bd17 100644
    ExternalEngineStateMachine* const MOZ_NON_OWNING_REF mOwner;
  };
 diff --git a/dom/media/MediaDecoder.cpp b/dom/media/MediaDecoder.cpp
-index 37ba39bf01..3e3f4467f3 100644
+index 37ba39bf01..bbb36405f4 100644
 --- a/dom/media/MediaDecoder.cpp
 +++ b/dom/media/MediaDecoder.cpp
 @@ -379,9 +379,21 @@ bool MediaDecoder::IsVideoDecodingSuspended() const {
@@ -234,7 +234,7 @@ index 37ba39bf01..3e3f4467f3 100644
      mDecoderStateMachine->DispatchSetPlaybackRate(mPlaybackRate);
    }
 diff --git a/dom/media/MediaDecoder.h b/dom/media/MediaDecoder.h
-index 98d4e9bffc..3a4757d940 100644
+index 98d4e9bffc..c9fd3020eb 100644
 --- a/dom/media/MediaDecoder.h
 +++ b/dom/media/MediaDecoder.h
 @@ -385,6 +385,12 @@ class MediaDecoder : public DecoderDoctorLifeLogger<MediaDecoder> {
@@ -356,7 +356,7 @@ index 69922d2c5a..92a4717573 100644
    MOZ_ASSERT(aDecoder);  // Use ShutdownDecoder() to clear.
    if (mDecoder) {
 diff --git a/dom/media/mediaelement/HTMLMediaElement.h b/dom/media/mediaelement/HTMLMediaElement.h
-index 74ec5b5edf..f4de51d00b 100644
+index 74ec5b5edf..948b5991cd 100644
 --- a/dom/media/mediaelement/HTMLMediaElement.h
 +++ b/dom/media/mediaelement/HTMLMediaElement.h
 @@ -907,6 +907,14 @@ class HTMLMediaElement : public nsGenericHTMLElement,
@@ -374,8 +374,36 @@ index 74ec5b5edf..f4de51d00b 100644
    void PlayInternal(bool aHandlingUserInput);
  
    // See spec, https://html.spec.whatwg.org/#internal-pause-steps
+diff --git a/dom/media/mediasource/MediaSource.cpp b/dom/media/mediasource/MediaSource.cpp
+index e7abc7bcd6..5566c96d7c 100644
+--- a/dom/media/mediasource/MediaSource.cpp
++++ b/dom/media/mediasource/MediaSource.cpp
+@@ -13,6 +13,9 @@
+ #include "MediaSourceDemuxer.h"
+ #include "SourceBuffer.h"
+ #include "SourceBufferList.h"
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++#  include "WebOSEngine.h"
++#endif
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/FloatingPoint.h"
+ #include "mozilla/Logging.h"
+@@ -148,6 +151,13 @@ void MediaSource::IsTypeSupported(const nsAString& aType,
+ 
+   bool hasVP9 = false;
+   const MediaCodecs& codecs = containerType->ExtendedType().Codecs();
++#ifdef MOZ_WEBOS_MEDIA_ENGINE
++  // Media Source streams play on the TV's pipeline, so a site must pick
++  // codecs it has (YouTube otherwise chooses Opus and ends up in software).
++  if (WebOSEngine::IsAvailable() && !WebOSEngine::SupportsCodecs(codecs)) {
++    return aRv.ThrowNotSupportedError("Can't play type");
++  }
++#endif
+   for (const auto& codec : codecs.Range()) {
+     if (IsVP9CodecString(codec)) {
+       hasVP9 = true;
 diff --git a/dom/media/mediasource/MediaSourceDecoder.cpp b/dom/media/mediasource/MediaSourceDecoder.cpp
-index ee40a73fd4..e941f17fad 100644
+index ee40a73fd4..3917666011 100644
 --- a/dom/media/mediasource/MediaSourceDecoder.cpp
 +++ b/dom/media/mediasource/MediaSourceDecoder.cpp
 @@ -2,6 +2,9 @@
@@ -424,7 +452,7 @@ index 1cf21c1f21..eafa8b902a 100644
                        MediaDecoderEventVisibility aEventVisibility) override;
  #endif
 diff --git a/dom/media/platforms/PDMFactory.cpp b/dom/media/platforms/PDMFactory.cpp
-index 6af74f901d..5fca8e771d 100644
+index 6af74f901d..3d914706f5 100644
 --- a/dom/media/platforms/PDMFactory.cpp
 +++ b/dom/media/platforms/PDMFactory.cpp
 @@ -44,6 +44,9 @@
@@ -1831,7 +1859,7 @@ index 0000000000..44fba424a2
 +}  // namespace mozilla
 diff --git a/dom/media/platforms/webos/WebOSEngineDecoderModule.h b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
 new file mode 100644
-index 0000000000..c0591f0aa4
+index 0000000000..30904deeb9
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngineDecoderModule.h
 @@ -0,0 +1,44 @@
@@ -1949,7 +1977,7 @@ index 41c0092894..a4c2a1b968 100644
                                           const wr::LayoutRect& aClip,
                                           bool aIsBackfaceVisible,
 diff --git a/gfx/webrender_bindings/WebRenderAPI.h b/gfx/webrender_bindings/WebRenderAPI.h
-index 82e9800231..b624ea52f4 100644
+index 82e9800231..398898430f 100644
 --- a/gfx/webrender_bindings/WebRenderAPI.h
 +++ b/gfx/webrender_bindings/WebRenderAPI.h
 @@ -656,6 +656,10 @@ class DisplayListBuilder final {
@@ -1964,7 +1992,7 @@ index 82e9800231..b624ea52f4 100644
                         const wr::LayoutRect& aClip, bool aIsBackfaceVisible,
                         const wr::ColorF& aColor);
 diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
-index a89cc039ea..282a6e727b 100644
+index a89cc039ea..d3c3e53713 100644
 --- a/gfx/webrender_bindings/src/bindings.rs
 +++ b/gfx/webrender_bindings/src/bindings.rs
 @@ -3434,6 +3434,26 @@ pub extern "C" fn wr_dp_push_rect(
@@ -1995,7 +2023,7 @@ index a89cc039ea..282a6e727b 100644
  pub extern "C" fn wr_dp_push_rect_with_animation(
      state: &mut WrState,
 diff --git a/gfx/wr/webrender/src/batch.rs b/gfx/wr/webrender/src/batch.rs
-index 3a15c9f6aa..3f811e2762 100644
+index 3a15c9f6aa..9917e50b52 100644
 --- a/gfx/wr/webrender/src/batch.rs
 +++ b/gfx/wr/webrender/src/batch.rs
 @@ -2,7 +2,7 @@
@@ -2098,7 +2126,7 @@ index 5205194881..a76ff24e96 100644
                          opaque_rect: pic_coverage_rect,
                          spanning_opaque_color: None,
 diff --git a/gfx/wr/webrender_api/src/display_item.rs b/gfx/wr/webrender_api/src/display_item.rs
-index e601a6df4f..bee6c2f2c2 100644
+index e601a6df4f..ff5d74a545 100644
 --- a/gfx/wr/webrender_api/src/display_item.rs
 +++ b/gfx/wr/webrender_api/src/display_item.rs
 @@ -53,6 +53,11 @@ bitflags! {
@@ -2114,7 +2142,7 @@ index e601a6df4f..bee6c2f2c2 100644
  }
  
 diff --git a/layout/generic/nsVideoFrame.cpp b/layout/generic/nsVideoFrame.cpp
-index 32c65b7e56..55432dbefe 100644
+index 32c65b7e56..716c1079ba 100644
 --- a/layout/generic/nsVideoFrame.cpp
 +++ b/layout/generic/nsVideoFrame.cpp
 @@ -620,6 +620,12 @@ class nsDisplayVideo final : public nsPaintedDisplayItem {
@@ -2172,7 +2200,7 @@ index 32c65b7e56..55432dbefe 100644
    // This is tracked by bug 1545498.
  
 diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
-index c00a539cb2..fc5298c279 100644
+index c00a539cb2..5ce88122f6 100644
 --- a/modules/libpref/init/StaticPrefList.yaml
 +++ b/modules/libpref/init/StaticPrefList.yaml
 @@ -12843,6 +12843,25 @@
@@ -2202,7 +2230,7 @@ index c00a539cb2..fc5298c279 100644
    type: bool
    value: false
 diff --git a/toolkit/moz.configure b/toolkit/moz.configure
-index 593f8b9b9c..ebb19e1d52 100644
+index 593f8b9b9c..646252ddb8 100644
 --- a/toolkit/moz.configure
 +++ b/toolkit/moz.configure
 @@ -830,6 +830,16 @@ set_define("MOZ_WMF", wmf)

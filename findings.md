@@ -1620,3 +1620,64 @@ packages. Truncate `geckotv.log` and delete `env` right after a logged run.
   addresses here instead of `library+offset`, so `build/symbolize-arm32.py`
   has nothing to resolve yet, and `libxul` from `mach package` has no
   symbols anyway.
+
+---
+
+## 23. Fixed: the browser closed on its own after two idle minutes
+
+On the webOS 6.5 TV, Firefox ended 2 to 7 minutes into a session with
+nothing in `geckotv.log`: no crash line, no child "channel error", and no
+clean-shutdown checkpoint in the profile. `/var/log/messages` only showed
+the card going invisible and Home coming back. The reason is in the TV's
+`/var/log/dbg-log` and `upload-log`: `SAM API_REQUEST closeByAppId` from
+`com.webos.surfacemanager.windowext`, then `NATIVE_APP_HANDLER
+CloseAsPolicy`, a `getAppLifeEvents close` with reason `userTimeout`, and
+`APP_CLOSED ... exit_status 15`. The compositor asked the app manager to
+close the app, and the app manager sent SIGTERM.
+
+The policy is QML in the compositor
+(`/usr/lib/qml/WebOSCompositor/views/StarfishScreenSaverView.qml` and
+`controllers/StarfishViewStateController.qml`). A repeating timer with the
+configd value `com.webos.surfacemanager.userActivityTimeout` (120000 ms on
+this TV) fires while the Magic Remote cursor is hidden and closes every
+window in the OVERLAY view with reason `userTimeout`, along with the
+on-screen keyboard, Home and alerts. The timer restarts on key presses the
+compositor sees, on cursor show and hide, and on notifications. Wheel
+notches never reach it, and pointer motion with the
+cursor already shown does not count, so reading a page or watching a video
+for two minutes was enough. The adapter's pop-up overlay in GL mode is a
+second toplevel of the app, and it was typed `_WEBOS_WINDOW_TYPE_OVERLAY`.
+Closing it means `closeByAppId` for a native app, which kills every
+Firefox process. Reason `windowPolicy` in the same logs is the other case,
+the card leaving the foreground.
+
+The overlay is now typed `_WEBOS_WINDOW_TYPE_FLOATING` with the window
+property `needFocus` set to `false`. The floating view sits on layer 2,
+directly above the fullscreen card's layer 1, draws the surface at its own
+size from the top left with alpha, takes no focus with that property, and
+is not touched by the user-activity handler. On the TV the window now
+comes up as a CARD and a FLOATING surface, and a launch left alone for
+four minutes was still running with no close request, where the OVERLAY
+build was closed after two.
+
+The GPU pop-up window (section 19, the add-on install prompt) was FLOATING
+as well, and the floating view closes its current window when a second one
+maps, so showing a GPU pop-up closed the app: on the TV the close request
+came 51 ms after the pop-up's window. A promoted content surface now gets
+no window at all. Its attach, damage and commit go to the overlay's window
+(`gp_attach`, `gp_request`), its frame requests get the virtual callbacks
+like every copied surface, and Firefox's destroy of it goes out unchanged.
+While its buffer is on the window the shared-memory pop-ups wait, this
+pop-up's own frame among them, and they come back when Firefox attaches
+nothing or destroys the surface. The window shrinks to the pop-up's buffer
+at the top left meanwhile, where the clicks were already taken. On the TV
+the install prompt showed on the overlay window and hid again 44 s later
+with no close request. `tests/adapter/gpu-popup.c` covers the promotion,
+the redirected requests, the hit rectangle and the hand-back.
+
+Other types looked at: POPUP grabs focus and closes the keyboard view when
+it appears. SYSTEM_UI goes to the HCAP view, which only opens while a TV
+input app is fullscreen. Resetting the timer through
+`wl_webos_input_manager.set_cursor_visibility` would flash the cursor every
+two minutes. The handler exempts an overlay with appId
+`com.webos.app.store-demo`, which is not a type of fix to ship.

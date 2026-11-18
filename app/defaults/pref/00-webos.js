@@ -90,6 +90,18 @@ pref("media.webos.engine.enabled", true);
 // has run on the defaults. Forcing software rendering on a TV SoC is a
 // large regression, so those lines are gone rather than merely flipped.
 
+// Widevine through the TV's own CDM, which the launcher hands to Firefox in
+// MOZ_GMP_PATH when hardware video is on (findings.md section 24). Linux
+// builds leave EME off by default. The CDM only decrypts into the TV's
+// secure video path, so the platform decoder (the webOS engine) must take
+// its output rather than the CDM's own decoder.
+pref("media.eme.enabled", true);
+pref("media.gmp-widevinecdm.visible", true);
+pref("media.gmp-widevinecdm.enabled", true);
+pref("media.gmp-widevinecdm.autoupdate", false);
+pref("media.gmp-widevinecdm.allow-chromium-update", false);
+pref("media.eme.video.prefer-platform-decoder", true);
+
 // Housekeeping.
 pref("browser.shell.checkDefaultBrowser", false);
 pref("datareporting.policy.dataSubmissionEnabled", false);

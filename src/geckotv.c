@@ -548,6 +548,74 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Widevine (findings.md section 22). The TV's own CDM wrapper,
+     * /usr/lib/libwvcdm_shared.so, implements the Chromium CDM interface
+     * Firefox's Widevine loader takes, and Firefox finds it through
+     * MOZ_GMP_PATH: a directory named after the plugin whose parent is
+     * gmp-widevinecdm, holding manifest.json and libwidevinecdm.so. Both are
+     * written here on every start, the library as a link to the TV's file.
+     * The CDM decrypts only into the pipeline's secure video path, so it is
+     * offered only while hardware video is on. GECKOTV_WIDEVINE=0 in the env
+     * file turns it off. */
+    {
+        const char *forced = getenv("GECKOTV_WIDEVINE");
+        const char *cdm = "/usr/lib/libwvcdm_shared.so";
+        char real[PATH_MAX];
+        const char *version = NULL;
+        /* The CDM's OEMCrypto layer opens the TEE through /dev/tee0. The
+         * jail of a Developer Mode app has no such node (LG's own apps get
+         * one from their jail configuration), and the CDM then reports a
+         * failed initialization to every site. Without the node, say
+         * "unsupported" instead. */
+        int tee = access("/dev/tee0", F_OK) == 0;
+        int on = getenv("GECKOTV_MEDIA_HELPER") != NULL && tee &&
+                 !(forced && forced[0] && atoi(forced) == 0);
+
+        if (on && realpath(cdm, real)) {
+            const char *base = strrchr(real, '/');
+
+            version = strstr(base ? base : real, ".so.");
+            version = version && version[4] ? version + 4 : "0.0.0.0";
+        } else {
+            on = 0;
+        }
+        if (on) {
+            char gmpdir[PATH_MAX];
+            FILE *mf;
+
+            snprintf(gmpdir, sizeof gmpdir, "%s/gmp/gmp-widevinecdm/%s", home, version);
+            mkdir_p(gmpdir);
+            snprintf(marker, sizeof marker, "%s/manifest.json", gmpdir);
+            mf = fopen(marker, "w");
+            if (mf) {
+                fprintf(mf,
+                        "{\"name\":\"WidevineCdm\",\"description\":\"LG webOS Widevine CDM\","
+                        "\"version\":\"%s\",\"x-cdm-module-versions\":\"4\","
+                        "\"x-cdm-interface-versions\":\"10\",\"x-cdm-host-versions\":\"10\","
+                        "\"x-cdm-codecs\":\"vp8,vp9.0,avc1\"}\n",
+                        version);
+                fclose(mf);
+            }
+            snprintf(marker, sizeof marker, "%s/libwidevinecdm.so", gmpdir);
+            unlink(marker);
+            if (!mf || symlink(cdm, marker) != 0) {
+                fprintf(stderr, "geckotv: widevine off (cannot write %s: %s)\n", gmpdir,
+                        strerror(errno));
+                unsetenv("MOZ_GMP_PATH");
+            } else {
+                setenv("MOZ_GMP_PATH", gmpdir, 1);
+                fprintf(stderr, "geckotv: widevine on (%s, %s)\n", real, gmpdir);
+            }
+        } else {
+            unsetenv("MOZ_GMP_PATH");
+            fprintf(stderr, "geckotv: widevine off (%s)\n",
+                    forced && forced[0] && atoi(forced) == 0 ? "GECKOTV_WIDEVINE"
+                    : !getenv("GECKOTV_MEDIA_HELPER")         ? "hardware video off"
+                    : !tee                                    ? "no /dev/tee0 in this jail"
+                                                              : "no libwvcdm_shared.so");
+        }
+    }
+
     /* Started by hand as root: Firefox refuses to run as root with a profile
      * owned by the app's own user and only says "Running Nightly as root". */
     {

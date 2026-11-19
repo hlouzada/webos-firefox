@@ -1868,7 +1868,8 @@ static int ov_ensure(void)
             }
         }
         all = wl_compositor_create_region(ov_compositor);
-        wl_region_add(all, 0, 0, ov_w, ov_h);
+        if (!getenv("WEBOS_XDG_OV_INPUT_NONE"))
+            wl_region_add(all, 0, 0, ov_w, ov_h);
         wl_surface_set_input_region(ov_surface, all);
         wl_region_destroy(all);
         ov_shown = 1;

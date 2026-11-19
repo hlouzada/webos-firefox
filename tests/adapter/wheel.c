@@ -92,6 +92,22 @@ int main(void)
           "wheel away from the user: axis -10, got %g", wl_fixed_to_double(got_axis_value));
     CHECK(got_discrete == -1 && got_value120 == -120, "with discrete -1 and value120 -120");
 
+    /* While the compositor is sending pointer events, it sends the wheel as
+     * its own wl_pointer.axis too, so the evdev notch must not be injected
+     * on top of it. */
+    win_w = 1920;
+    win_h = 1080;
+    mapped_one = 1;
+    got_axis_calls = 0;
+    note_real_pointer();
+    apply_remote_event((struct ptr_ev){ .button = -2, .down = 1, .x = 960, .y = 540 });
+    CHECK(got_axis_calls == 0, "a notch while the real pointer is live is not injected (%d)",
+          got_axis_calls);
+    last_real_pointer.tv_sec -= 60;
+    apply_remote_event((struct ptr_ev){ .button = -2, .down = 1, .x = 960, .y = 540 });
+    CHECK(got_axis_calls == 1, "a notch with the real pointer silent for a minute is injected (%d)",
+          got_axis_calls);
+
     printf("%d failure(s)\n", failures);
     return failures != 0;
 }

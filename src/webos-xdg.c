@@ -4146,6 +4146,48 @@ static void ensure_text_model(void)
     log_msg("text model %p", (void *)text_input);
 }
 
+static struct hook *primary_pointer(void);
+static void focus_and_move(struct hook *hook, struct wl_surface *target, int lx, int ly);
+
+/* The Magic Remote's real pointer arrives on a secondary seat. GTK re-binds
+ * a new content surface (a new tab, about:addons and other in-process pages)
+ * to the primary seat only, so events on the secondary seat stop reaching the
+ * page after such a load. Deliver the overlay's real pointer on the primary
+ * seat instead, the one the evdev injection already uses.
+ * WEBOS_XDG_OV_PRIMARY_SEAT=0 forwards on the arriving seat as before. With
+ * ov_mu not held (ov_route_primary takes it through ov_hit). */
+static int ov_primary_seat(void)
+{
+    static int on = -1;
+    const char *e;
+
+    if (on < 0) {
+        e = getenv("WEBOS_XDG_OV_PRIMARY_SEAT");
+        on = !e || strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+static void ov_route_primary(int px, int py, int has_button, uint32_t button, uint32_t state)
+{
+    struct hook *ph = primary_pointer();
+    const struct wl_pointer_listener *pk = ph ? ph->listener : NULL;
+    int32_t ox = 0, oy = 0;
+    struct wl_surface *hit = ov_hit(px, py, &ox, &oy);
+    struct wl_surface *target = hit ? hit : main_surface;
+    int lx = hit ? px - ox : px;
+    int ly = hit ? py - oy : py;
+
+    if (!ph || !pk || !target)
+        return;
+    focus_and_move(ph, target, lx, ly);
+    if (has_button && pk->button) {
+        pk->button(ph->data, (struct wl_pointer *)ph->proxy, ++g.serial, 0, button, state);
+        if (pk->frame)
+            pk->frame(ph->data, (struct wl_pointer *)ph->proxy);
+    }
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 {
@@ -4166,6 +4208,14 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         if (ov_w > 0 && ov_w < 1920 && ((x >> 8) >= ov_w || (y >> 8) >= ov_h)) {
             x = (wl_fixed_t)((int64_t)x * ov_w / 1920);
             y = (wl_fixed_t)((int64_t)y * ov_h / 1080);
+        }
+        if (ov_primary_seat()) {
+            last_x = x >> 8;
+            last_y = y >> 8;
+            saw_motion = 1;
+            note_real_pointer();
+            ov_route_primary(last_x, last_y, 0, 0, 0);
+            return;
         }
         hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
         ov_ptr_serial = serial;
@@ -4215,6 +4265,17 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
 
     if ((ov_surface && surface == ov_surface) ||
         (gl_mode() && surface == (struct wl_surface *)gl_window)) {
+        if (ov_primary_seat()) {
+            struct hook *ph = primary_pointer();
+            const struct wl_pointer_listener *pk = ph ? ph->listener : NULL;
+
+            if (ph && pk && pk->leave && synth_focus)
+                pk->leave(ph->data, (struct wl_pointer *)ph->proxy, ++g.serial, synth_focus);
+            synth_focus = NULL;
+            ov_ptr_popup = NULL;
+            ov_ptr_on = 0;
+            return;
+        }
         if (ov_ptr_popup && orig && orig->leave)
             orig->leave(data, pointer, serial, ov_ptr_popup);
         else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
@@ -4246,6 +4307,10 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     last_y = y >> 8;
     saw_motion = 1;
     note_real_pointer();
+    if (ov_ptr_on && ov_primary_seat()) {
+        ov_route_primary(last_x, last_y, 0, 0, 0);
+        return;
+    }
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
         struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);

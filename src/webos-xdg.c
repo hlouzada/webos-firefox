@@ -4408,11 +4408,15 @@ static void apply_remote_event(struct ptr_ev ev)
         hide_keyboard();
         return;
     }
-    /* The compositor closes the window when it sees this notch.
-     * Hand it to every seat as a scroll instead. */
+    /* The compositor closes the window when it sees this notch. Hand it to
+     * every seat as a scroll instead, unless the compositor is sending
+     * pointer events: then it sends the notch as wl_pointer.axis itself,
+     * and a second copy would scroll twice as far. */
     if (ev.button == -2) {
         int i;
 
+        if (real_pointer_active())
+            return;
         for (i = 0; i < MAX_HOOK; i++) {
             if (pointer_hooks[i].proxy && pointer_hooks[i].listener) {
                 deliver_wheel(&pointer_hooks[i], ev.down, fx, fy);

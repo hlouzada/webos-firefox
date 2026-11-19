@@ -1,6 +1,6 @@
 #!/bin/bash
 # Host tests of src/webos-xdg.c covering video plane placement, toplevel
-# states, GPU pop-ups and the overlay's input region. Needs wayland-scanner and the wayland-client headers and library on
+# states, GPU pop-ups, the overlay's input region and the wheel. Needs wayland-scanner and the wayland-client headers and library on
 # the host (conda's work with WAYLAND_PREFIX=$HOME/miniconda3), and
 # xdg-shell.xml plus
 # text-input-unstable-v3.xml from wayland-protocols, fetched if missing.
@@ -38,7 +38,7 @@ struct wl_display *webos_xdg_proxy_display(struct wl_proxy *p) { (void)p; return
 int webos_xdg_on_default_queue(struct wl_proxy *p) { (void)p; return 1; }
 STUBS
 status=0
-for t in video-clip toplevel-state gpu-popup overlay-input; do
+for t in video-clip toplevel-state gpu-popup overlay-input wheel; do
     gcc -std=gnu11 -w -I"$GEN" -I"$PREFIX/include" -o "$BUILD/$t" "$HERE/$t.c" \
         "$GEN"/*-protocol.c "$GEN/stubs.c" -L"$PREFIX/lib" -Wl,-rpath,"$PREFIX/lib" \
         -lwayland-client -lxkbcommon -lpthread -ldl -lm

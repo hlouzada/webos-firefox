@@ -1836,16 +1836,20 @@ static int ov_ensure(void)
     if (gl_mode()) {
         /* A second toplevel of the app typed FLOATING. The compositor of a
          * webOS 6.5 TV draws it over the card, blended (findings.md section
-         * 19). It takes no input, so the pointer stays on the GL window, and
-         * needFocus=false keeps the compositor's keyboard focus on the card.
-         * Not OVERLAY: the compositor closes every OVERLAY window, and with
-         * it the whole native app, two minutes after the last remote input
-         * it saw (findings.md section 23). It is the app's only window
-         * besides the card: a second FLOATING one closes the app too, so
-         * GPU pop-ups borrow it (gp_items). It is never destroyed because
-         * the card is minimized the moment a second surface of the app
-         * goes away. */
-        struct wl_region *none;
+         * 19), and needFocus=false keeps its keyboard focus on the card.
+         * It takes the pointer for the whole window: the compositor hands
+         * hover and clicks to the topmost window under the cursor by
+         * rectangle, whatever its input region, and drops them where the
+         * region does not contain the point (findings.md section 25).
+         * pointer_enter routes them to the pop-up under the pointer or to
+         * GTK's window. Not OVERLAY: the compositor closes every OVERLAY
+         * window, and with it the whole native app, two minutes after the
+         * last remote input it saw (findings.md section 23). It is the
+         * app's only window besides the card: a second FLOATING one closes
+         * the app too, so GPU pop-ups borrow it (gp_items). It is never
+         * destroyed because the card is minimized the moment a second
+         * surface of the app goes away. */
+        struct wl_region *all;
 
         ss = shell_role((struct wl_proxy *)ov_surface);
         if (ss)
@@ -1863,11 +1867,12 @@ static int ov_ensure(void)
                 gp_window_listen(ws);
             }
         }
-        none = wl_compositor_create_region(ov_compositor);
-        wl_surface_set_input_region(ov_surface, none);
-        wl_region_destroy(none);
+        all = wl_compositor_create_region(ov_compositor);
+        wl_region_add(all, 0, 0, ov_w, ov_h);
+        wl_surface_set_input_region(ov_surface, all);
+        wl_region_destroy(all);
         ov_shown = 1;
-        log_msg("pop-up overlay %p, %dx%d: a FLOATING window over the GL window",
+        log_msg("pop-up overlay %p, %dx%d: a FLOATING window over the GL window, takes the pointer",
                 (void *)ov_surface, ov_w, ov_h);
         return 1;
     }

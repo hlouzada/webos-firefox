@@ -1045,9 +1045,10 @@ full-screen transparent surface of the app typed OVERLAY, made by
 since destroying it would minimize the card. Firefox draws menus and
 panels in software because a pop-up without remote content gets no
 accelerated widget, so their buffers are shared memory and the flat-mode
-copy applies. The overlay's input region is empty, so pointer events
-arrive on the GL window and `ov_hit` sends them to the pop-up under them
-by rectangle. Mapping the overlay moves the keyboard focus to it and back,
+copy applies. The overlay's input region was empty so that pointer events
+would arrive on the GL window, with `ov_hit` sending them to the pop-up
+under them by rectangle; section 25 found that no pointer event arrived at
+all that way, and the overlay now takes them itself. Mapping the overlay moves the keyboard focus to it and back,
 and the adapter reports both as GTK's window. On the tester's TV on
 2026-11-17 the hamburger menu, extensions, account, tab list and site
 identity pop-ups and tooltips were verified to draw and work, also while a
@@ -1837,3 +1838,46 @@ does the same from a native service of a Developer Mode package on webOS 25.
 Both suggest that newer firmware lets a Developer Mode process reach the TEE;
 the webOS 6.5 jail does not. The launcher's `widevine on` / `widevine off (no
 /dev/tee0 in this jail)` line answers that question for any TV without root.
+
+---
+
+## 25. Fixed: no hover with the Magic Remote until a click (2026-11-19)
+
+**Symptom.** Links and buttons highlighted only when clicked. Moving the
+pointer over the page changed nothing.
+
+**Evidence.** A `wayland-debug` run of 0.1.51 on the webOS 6.5.3 TV, with
+the pointer moved over the page for ten seconds and one link clicked: not a
+single `wl_pointer` event from the compositor, while `wl_keyboard.enter`
+arrived. The click came from the adapter's evdev path, which sends an enter
+and a motion before the button, so the hover state appeared exactly at the
+click. The release log of a three-hour session had no "real pointer is
+live" line either.
+
+**Cause.** Since the pop-up overlay is a full-screen FLOATING window
+(section 23) it is the topmost window under the cursor. The compositor's
+Qt Quick scene hands hover to the topmost item whose rectangle contains the
+point, whatever its Wayland input region (`deliverHoverEvent` stops at the
+first hover-enabled item that `contains` the point), and LG's
+`WebOSSurfaceItem` drops an event outside the surface's input region rather
+than passing it on. With the overlay's empty region every pointer event
+ended there. The compositor's own full-view `MouseArea` is not the sink: it
+is disabled for the floating view (`consumeMouseEvents` in
+`/usr/lib/qml/WebOSCompositorBase/views/base/SurfaceView.qml`).
+
+**Fix.** The overlay's input region covers the whole window. The compositor
+then sends enter, motion, button and axis for the overlay surface, and
+`pointer_enter` and `pointer_motion` route them to the pop-up under the
+pointer by rectangle or to GTK's window, the path the webOS 4 overlay
+already used. A second traced run on the TV: enter on the overlay surface,
+1985 motion events, 32 button events, links highlighting as the pointer
+passes, and "real pointer is live, not injecting clicks" in the log. The
+window's `needFocus=false` keeps those clicks from moving the keyboard
+focus (`grabKeyboardFocusOnClick` follows it in `StarfishFloatingView.qml`),
+and the app stayed up through them.
+
+A notch now arrives twice, as the compositor's `wl_pointer.axis` of 10 and
+as the adapter's own injection from evdev, so the injection is skipped
+while the real pointer is live, as clicks are. `tests/adapter/overlay-input.c`
+reads the marshalled requests back from the socket and checks the region;
+`tests/adapter/wheel.c` checks the skipped notch.

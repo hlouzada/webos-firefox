@@ -4188,6 +4188,20 @@ static void ov_route_primary(int px, int py, int has_button, uint32_t button, ui
     }
 }
 
+/* The seat to deliver a real overlay axis or frame event on: the primary seat
+ * in primary-seat mode, so the wheel follows the enter and motion routed there
+ * (ov_route_primary); otherwise the seat the event arrived on. */
+static struct hook *ov_delivery_hook(struct hook *arriving)
+{
+    if (ov_ptr_on && ov_primary_seat()) {
+        struct hook *ph = primary_pointer();
+
+        if (ph && ph->listener)
+            return ph;
+    }
+    return arriving;
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 {
@@ -4686,69 +4700,84 @@ static void start_remote_pointer(void)
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
                          uint32_t axis, wl_fixed_t value)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis)
-        orig->axis(data, pointer, time, axis, value);
+        orig->axis(hook->data, (struct wl_pointer *)hook->proxy, time, axis, value);
 }
 
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->frame)
-        orig->frame(data, pointer);
+        orig->frame(hook->data, (struct wl_pointer *)hook->proxy);
 }
 
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_source)
-        orig->axis_source(data, pointer, source);
+        orig->axis_source(hook->data, (struct wl_pointer *)hook->proxy, source);
 }
 
 static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time,
                               uint32_t axis)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_stop)
-        orig->axis_stop(data, pointer, time, axis);
+        orig->axis_stop(hook->data, (struct wl_pointer *)hook->proxy, time, axis);
 }
 
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
                                   int32_t discrete)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_discrete)
-        orig->axis_discrete(data, pointer, axis, discrete);
+        orig->axis_discrete(hook->data, (struct wl_pointer *)hook->proxy, axis, discrete);
 }
 
 static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis,
                                   int32_t value120)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_value120)
-        orig->axis_value120(data, pointer, axis, value120);
+        orig->axis_value120(hook->data, (struct wl_pointer *)hook->proxy, axis, value120);
 }
 
 static void pointer_axis_relative_direction(void *data, struct wl_pointer *pointer,
                                             uint32_t axis, uint32_t direction)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_relative_direction)
-        orig->axis_relative_direction(data, pointer, axis, direction);
+        orig->axis_relative_direction(hook->data, (struct wl_pointer *)hook->proxy, axis,
+                                      direction);
 }
 
 static const struct wl_pointer_listener pointer_wrapper = {

@@ -4349,7 +4349,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 
     note_real_pointer();
     log_msg("click button %u state %u x %d y %d", button, state, last_x, last_y);
-    if (orig && orig->button)
+    if (ov_ptr_on && ov_primary_seat())
+        ov_route_primary(last_x, last_y, 1, button, state);
+    else if (orig && orig->button)
         orig->button(data, pointer, serial, time, button, state);
     /* Address field sits under the tab strip and left of the menu button.
      * Coordinates are surface-local, so only judge them on the main window;

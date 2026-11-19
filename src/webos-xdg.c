@@ -4208,6 +4208,17 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    {
+        struct hook *ph = primary_pointer();
+
+        log_msg("ENTER seat=%ld surf=%p %s orig=%p main=%p gl_window=%p ov=%p primary=%ld",
+                hook ? (long)(hook - pointer_hooks) : -1L, (void *)surface,
+                surface == ov_surface ? "overlay"
+                        : surface == (struct wl_surface *)gl_window ? "gl_window"
+                        : surface == main_surface ? "main" : "other",
+                (void *)orig, (void *)main_surface, (void *)gl_window, (void *)ov_surface,
+                ph ? (long)(ph - pointer_hooks) : -1L);
+    }
     /* On the pop-up overlay or the GL window, GTK is told about the
      * pop-up under the pointer. */
     ov_ptr_on = (ov_surface && surface == ov_surface) ||
@@ -4362,7 +4373,11 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
     note_real_pointer();
-    log_msg("click button %u state %u x %d y %d", button, state, last_x, last_y);
+    log_msg("click button %u state %u x %d y %d seat=%ld orig=%p btn=%p ov_ptr_on=%d popup=%p "
+            "synth=%s",
+            button, state, last_x, last_y, hook ? (long)(hook - pointer_hooks) : -1L,
+            (void *)orig, orig ? (void *)orig->button : NULL, ov_ptr_on, (void *)ov_ptr_popup,
+            synth_focus == main_surface ? "main" : synth_focus ? "other" : "null");
     if (ov_ptr_on && ov_primary_seat())
         ov_route_primary(last_x, last_y, 1, button, state);
     else if (orig && orig->button)

@@ -1901,7 +1901,8 @@ static int ov_ensure(void)
             }
         }
         all = wl_compositor_create_region(ov_compositor);
-        wl_region_add(all, 0, 0, ov_w, ov_h);
+        if (!getenv("WEBOS_XDG_OV_INPUT_NONE"))
+            wl_region_add(all, 0, 0, ov_w, ov_h);
         wl_surface_set_input_region(ov_surface, all);
         wl_region_destroy(all);
         ov_shown = 1;
@@ -4188,12 +4189,79 @@ static void ensure_text_model(void)
     log_msg("text model %p", (void *)text_input);
 }
 
+static struct hook *primary_pointer(void);
+static void focus_and_move(struct hook *hook, struct wl_surface *target, int lx, int ly);
+
+/* The Magic Remote's real pointer arrives on a secondary seat. GTK re-binds
+ * a new content surface (a new tab, about:addons and other in-process pages)
+ * to the primary seat only, so events on the secondary seat stop reaching the
+ * page after such a load. Deliver the overlay's real pointer on the primary
+ * seat instead, the one the evdev injection already uses.
+ * WEBOS_XDG_OV_PRIMARY_SEAT=0 forwards on the arriving seat as before. With
+ * ov_mu not held (ov_route_primary takes it through ov_hit). */
+static int ov_primary_seat(void)
+{
+    static int on = -1;
+    const char *e;
+
+    if (on < 0) {
+        e = getenv("WEBOS_XDG_OV_PRIMARY_SEAT");
+        on = !e || strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+static void ov_route_primary(int px, int py, int has_button, uint32_t button, uint32_t state)
+{
+    struct hook *ph = primary_pointer();
+    const struct wl_pointer_listener *pk = ph ? ph->listener : NULL;
+    int32_t ox = 0, oy = 0;
+    struct wl_surface *hit = ov_hit(px, py, &ox, &oy);
+    struct wl_surface *target = hit ? hit : main_surface;
+    int lx = hit ? px - ox : px;
+    int ly = hit ? py - oy : py;
+
+    if (!ph || !pk || !target)
+        return;
+    focus_and_move(ph, target, lx, ly);
+    if (has_button && pk->button) {
+        pk->button(ph->data, (struct wl_pointer *)ph->proxy, ++g.serial, 0, button, state);
+        if (pk->frame)
+            pk->frame(ph->data, (struct wl_pointer *)ph->proxy);
+    }
+}
+
+/* The seat to deliver a real overlay axis or frame event on: the primary seat
+ * in primary-seat mode, so the wheel follows the enter and motion routed there
+ * (ov_route_primary); otherwise the seat the event arrived on. */
+static struct hook *ov_delivery_hook(struct hook *arriving)
+{
+    if (ov_ptr_on && ov_primary_seat()) {
+        struct hook *ph = primary_pointer();
+
+        if (ph && ph->listener)
+            return ph;
+    }
+    return arriving;
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
 {
     struct hook *hook = hook_find(pointer_hooks, pointer);
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    {
+        struct hook *ph = primary_pointer();
+
+        log_trace("ENTER seat=%ld surf=%p %s orig=%p main=%p gl_window=%p ov=%p primary=%ld",
+                  hook ? (long)(hook - pointer_hooks) : -1L, (void *)surface,
+                  surface == ov_surface ? "overlay"
+                          : surface == (struct wl_surface *)gl_window ? "gl_window"
+                          : surface == main_surface ? "main" : "other",
+                  (void *)orig, (void *)main_surface, (void *)gl_window, (void *)ov_surface,
+                  ph ? (long)(ph - pointer_hooks) : -1L);
+    }
     /* On the pop-up overlay or the GL window, GTK is told about the
      * pop-up under the pointer. */
     ov_ptr_on = (ov_surface && surface == ov_surface) ||
@@ -4208,6 +4276,14 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
         if (ov_w > 0 && ov_w < 1920 && ((x >> 8) >= ov_w || (y >> 8) >= ov_h)) {
             x = (wl_fixed_t)((int64_t)x * ov_w / 1920);
             y = (wl_fixed_t)((int64_t)y * ov_h / 1080);
+        }
+        if (ov_primary_seat()) {
+            last_x = x >> 8;
+            last_y = y >> 8;
+            saw_motion = 1;
+            note_real_pointer();
+            ov_route_primary(last_x, last_y, 0, 0, 0);
+            return;
         }
         hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
         ov_ptr_serial = serial;
@@ -4257,6 +4333,17 @@ static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t seria
 
     if ((ov_surface && surface == ov_surface) ||
         (gl_mode() && surface == (struct wl_surface *)gl_window)) {
+        if (ov_primary_seat()) {
+            struct hook *ph = primary_pointer();
+            const struct wl_pointer_listener *pk = ph ? ph->listener : NULL;
+
+            if (ph && pk && pk->leave && synth_focus)
+                pk->leave(ph->data, (struct wl_pointer *)ph->proxy, ++g.serial, synth_focus);
+            synth_focus = NULL;
+            ov_ptr_popup = NULL;
+            ov_ptr_on = 0;
+            return;
+        }
         if (ov_ptr_popup && orig && orig->leave)
             orig->leave(data, pointer, serial, ov_ptr_popup);
         else if (!ov_ptr_popup && gl_mode() && main_surface && orig && orig->leave)
@@ -4288,6 +4375,10 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     last_y = y >> 8;
     saw_motion = 1;
     note_real_pointer();
+    if (ov_ptr_on && ov_primary_seat()) {
+        ov_route_primary(last_x, last_y, 0, 0, 0);
+        return;
+    }
     if (ov_ptr_on) {
         int32_t ox = 0, oy = 0;
         struct wl_surface *hit = ov_hit(x >> 8, y >> 8, &ox, &oy);
@@ -4325,8 +4416,14 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
     note_real_pointer();
-    log_trace("click button %u state %u x %d y %d", button, state, last_x, last_y);
-    if (orig && orig->button)
+    log_trace("click button %u state %u x %d y %d seat=%ld orig=%p btn=%p ov_ptr_on=%d popup=%p "
+              "synth=%s",
+              button, state, last_x, last_y, hook ? (long)(hook - pointer_hooks) : -1L,
+              (void *)orig, orig ? (void *)orig->button : NULL, ov_ptr_on, (void *)ov_ptr_popup,
+              synth_focus == main_surface ? "main" : synth_focus ? "other" : "null");
+    if (ov_ptr_on && ov_primary_seat())
+        ov_route_primary(last_x, last_y, 1, button, state);
+    else if (orig && orig->button)
         orig->button(data, pointer, serial, time, button, state);
     /* Address field sits under the tab strip and left of the menu button.
      * Coordinates are surface-local, so only judge them on the main window;
@@ -4665,69 +4762,84 @@ static void start_remote_pointer(void)
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
                          uint32_t axis, wl_fixed_t value)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis)
-        orig->axis(data, pointer, time, axis, value);
+        orig->axis(hook->data, (struct wl_pointer *)hook->proxy, time, axis, value);
 }
 
 static void pointer_frame(void *data, struct wl_pointer *pointer)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->frame)
-        orig->frame(data, pointer);
+        orig->frame(hook->data, (struct wl_pointer *)hook->proxy);
 }
 
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_source)
-        orig->axis_source(data, pointer, source);
+        orig->axis_source(hook->data, (struct wl_pointer *)hook->proxy, source);
 }
 
 static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time,
                               uint32_t axis)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_stop)
-        orig->axis_stop(data, pointer, time, axis);
+        orig->axis_stop(hook->data, (struct wl_pointer *)hook->proxy, time, axis);
 }
 
 static void pointer_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis,
                                   int32_t discrete)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_discrete)
-        orig->axis_discrete(data, pointer, axis, discrete);
+        orig->axis_discrete(hook->data, (struct wl_pointer *)hook->proxy, axis, discrete);
 }
 
 static void pointer_axis_value120(void *data, struct wl_pointer *pointer, uint32_t axis,
                                   int32_t value120)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_value120)
-        orig->axis_value120(data, pointer, axis, value120);
+        orig->axis_value120(hook->data, (struct wl_pointer *)hook->proxy, axis, value120);
 }
 
 static void pointer_axis_relative_direction(void *data, struct wl_pointer *pointer,
                                             uint32_t axis, uint32_t direction)
 {
-    struct hook *hook = hook_find(pointer_hooks, pointer);
+    struct hook *hook = ov_delivery_hook(hook_find(pointer_hooks, pointer));
     const struct wl_pointer_listener *orig = hook ? hook->listener : NULL;
 
+    (void)data;
+    (void)pointer;
     if (orig && orig->axis_relative_direction)
-        orig->axis_relative_direction(data, pointer, axis, direction);
+        orig->axis_relative_direction(hook->data, (struct wl_pointer *)hook->proxy, axis,
+                                      direction);
 }
 
 static const struct wl_pointer_listener pointer_wrapper = {

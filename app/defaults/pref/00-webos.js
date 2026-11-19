@@ -305,6 +305,11 @@ pref("browser.startup.homepage", "about:blank");
 pref("startup.homepage_welcome_url", "");
 pref("browser.newtabpage.enabled", false);
 
+// The launcher disables the Firefox process sandboxes because the app already
+// runs inside the webOS jail. Without this the first window shows "The
+// security sandbox is disabled" on every start.
+pref("security.sandbox.warn_content_disabled", false);
+
 // Marionette (off unless <app dir>/marionette exists) applies "recommended"
 // test preferences: dummy add-on and blocklist servers, Safe Browsing off,
 // updates disabled. If Firefox stops without a clean shutdown they stay in

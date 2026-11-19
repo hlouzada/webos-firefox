@@ -1,0 +1,22 @@
+diff --git a/security/sandbox/common/SandboxUtils.sys.mjs b/security/sandbox/common/SandboxUtils.sys.mjs
+index 1164782abe..9f80f93f90 100644
+--- a/security/sandbox/common/SandboxUtils.sys.mjs
++++ b/security/sandbox/common/SandboxUtils.sys.mjs
+@@ -77,6 +77,17 @@ export var SandboxUtils = {
+    *        The window where the notification will be displayed.
+    */
+   maybeWarnAboutDisabledContentSandbox(aWindow) {
++    // Off on platforms where another layer, such as the webOS app jail,
++    // isolates the process and the sandbox is disabled on purpose.
++    if (
++      !Services.prefs.getBoolPref(
++        "security.sandbox.warn_content_disabled",
++        true
++      )
++    ) {
++      return;
++    }
++
+     const sandboxSettings = Cc[
+       "@mozilla.org/sandbox/sandbox-settings;1"
+     ].getService(Ci.mozISandboxSettings);

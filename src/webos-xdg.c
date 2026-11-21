@@ -5351,6 +5351,26 @@ void webos_xdg_wrapper_destroy_report(struct wl_proxy *proxy, void *caller)
             proxy_name(proxy), by);
 }
 
+/* GTK destroys its toplevel wl_surface when the window is hidden or closed.
+ * Everything the adapter synthesizes names that surface: pointer enter and
+ * leave for the overlay and the GL window, the text-input enter, the
+ * held-back keyboard leave. A GDK handler given the freed proxy reads its
+ * user data from freed memory. */
+static void main_surface_destroyed(void)
+{
+    int i;
+
+    log_msg("main window surface %p destroyed", (void *)main_surface);
+    main_surface = NULL;
+    synth_focus = NULL;
+    keyboard_focus_raw = NULL;
+    for (i = 0; i < MAX_HOOK; i++)
+        keyboard_hooks[i].held_leave = 0;
+    text_input_entered = 0;
+    /* The next window GTK maps is the first one again. */
+    mapped_one = 0;
+}
+
 int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
                         const struct wl_interface *interface, uint32_t version,
                         uint32_t flags, union wl_argument *args, struct wl_proxy **out)
@@ -5448,6 +5468,8 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
         forget_shell_role(proxy);
         if (ov_enabled())
             ov_surface_destroyed(proxy);
+        if ((struct wl_surface *)proxy == main_surface)
+            main_surface_destroyed();
         if (main_group && (struct wl_surface *)proxy == group_root)
             drop_group();
     }

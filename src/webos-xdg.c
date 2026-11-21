@@ -313,110 +313,142 @@ static ssize_t read_own_memory(void *dst, const void *src, size_t n)
     return syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL);
 }
 
-/* Executable mappings, read once in the crash handler without stdio or
- * malloc (the fault may be inside malloc). */
-static char crash_maps[192 * 1024];
-static struct { unsigned long lo, hi, pgoff; const char *name; } crash_exec[512];
-/* Each mapped file's first mapping (see crash_load_maps). */
-static struct { const char *name; unsigned long lo; } crash_base[64];
-static int crash_nbase;
-static int crash_nexec;
-static unsigned long crash_stack_hi;
+/* Executable mappings, read in the crash handler without stdio or malloc
+ * (the fault may be inside malloc). /proc/self/maps is streamed line by
+ * line: the Firefox parent has thousands of mappings. */
+#define CRASH_FILES 256
+#define CRASH_EXEC 2048
+static struct { char name[48]; unsigned long base; } crash_file[CRASH_FILES];
+static struct { unsigned long lo, hi, pgoff; int file; } crash_exec[CRASH_EXEC];
+static int crash_nfile, crash_nexec, crash_nexec_lost;
+static unsigned long crash_stack_lo, crash_stack_hi;
 
-static void crash_load_maps(unsigned long sp)
+static int crash_file_index(const char *name)
 {
-    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    size_t len = 0;
-    ssize_t r;
-    char *p, *end;
+    int k;
 
-    if (fd < 0)
+    for (k = 0; k < crash_nfile; k++)
+        if (!strcmp(crash_file[k].name, name))
+            return k;
+    if (crash_nfile == CRASH_FILES)
+        return -1;
+    strncpy(crash_file[k].name, name, sizeof crash_file[k].name - 1);
+    crash_file[k].base = 0;
+    crash_nfile++;
+    return k;
+}
+
+/* One line of /proc/self/maps: "lo-hi perms pgoff dev inode path". */
+static void crash_map_line(char *line, unsigned long sp)
+{
+    unsigned long lo, hi, pgoff;
+    char *q, *perms, *slash;
+    int file = -1;
+
+    lo = strtoul(line, &q, 16);
+    if (*q != '-')
         return;
-    while (len < sizeof crash_maps - 1 &&
-           (r = read(fd, crash_maps + len, sizeof crash_maps - 1 - len)) > 0)
-        len += r;
-    close(fd);
-    crash_maps[len] = '\0';
-    for (p = crash_maps; *p && crash_nexec < 512; p = end + 1) {
-        unsigned long lo, hi, pgoff;
-        char *q, *slash;
-
-        end = strchr(p, '\n');
-        if (!end)
-            break;
-        *end = '\0';
-        lo = strtoul(p, &q, 16);
-        hi = strtoul(q + 1, &q, 16);
-        if (sp >= lo && sp < hi)
-            crash_stack_hi = hi;
-        pgoff = strtoul(q + 6, &q, 16);
-        slash = strrchr(q, '/');
+    hi = strtoul(q + 1, &q, 16);
+    if (q[0] != ' ' || strlen(q) < 6)
+        return;
+    perms = q + 1;                                       /* "r-xp" */
+    pgoff = strtoul(perms + 5, &q, 16);
+    if (sp >= lo && sp < hi) {
+        crash_stack_lo = lo;
+        crash_stack_hi = hi;
+    }
+    slash = strrchr(q, '/');
+    if (slash) {
+        file = crash_file_index(slash + 1);
         /* The file's first mapping (offset 0) is where its address 0 is:
          * offsets printed from it match nm and addr2line. A file offset
          * does not: lld puts code 64 KB higher in memory than in the file
          * (the firefox binary), GNU ld does not (GTK's libraries). */
-        if (pgoff == 0 && slash && crash_nbase < 64) {
-            int k;
+        if (file >= 0 && pgoff == 0 && crash_file[file].base == 0)
+            crash_file[file].base = lo;
+    }
+    if (perms[2] != 'x')
+        return;
+    if (crash_nexec == CRASH_EXEC) {
+        crash_nexec_lost++;
+        return;
+    }
+    crash_exec[crash_nexec].lo = lo;
+    crash_exec[crash_nexec].hi = hi;
+    crash_exec[crash_nexec].pgoff = pgoff;
+    crash_exec[crash_nexec].file = file;
+    crash_nexec++;
+}
 
-            for (k = 0; k < crash_nbase && strcmp(crash_base[k].name, slash + 1); k++)
-                ;
-            if (k == crash_nbase) {
-                crash_base[k].name = slash + 1;
-                crash_base[k].lo = lo;
-                crash_nbase++;
+static void crash_load_maps(unsigned long sp)
+{
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    char buf[4096], line[512];
+    size_t ll = 0;
+    ssize_t r, i;
+
+    if (fd < 0)
+        return;
+    while ((r = read(fd, buf, sizeof buf)) > 0) {
+        for (i = 0; i < r; i++) {
+            if (buf[i] == '\n') {
+                line[ll] = '\0';
+                crash_map_line(line, sp);
+                ll = 0;
+            } else if (ll < sizeof line - 1) {
+                line[ll++] = buf[i];      /* a longer line loses its tail */
             }
         }
-        if (q[3] != 'x')                       /* " r-xp" */
-            continue;
-        crash_exec[crash_nexec].lo = lo;
-        crash_exec[crash_nexec].hi = hi;
-        crash_exec[crash_nexec].pgoff = pgoff;
-        crash_exec[crash_nexec].name = slash ? slash + 1 : "[anon]";
-        crash_nexec++;
     }
+    close(fd);
+}
+
+static const char *crash_exec_name(int i)
+{
+    return crash_exec[i].file >= 0 ? crash_file[crash_exec[i].file].name : "[anon]";
 }
 
 static unsigned long crash_module_offset(int i, unsigned long a)
 {
-    int k;
+    int f = crash_exec[i].file;
 
-    for (k = 0; k < crash_nbase; k++)
-        if (!strcmp(crash_base[k].name, crash_exec[i].name) && crash_base[k].lo <= a)
-            return a - crash_base[k].lo;
+    if (f >= 0 && crash_file[f].base && crash_file[f].base <= a)
+        return a - crash_file[f].base;
     return a - crash_exec[i].lo + crash_exec[i].pgoff;
+}
+
+static int crash_exec_find(unsigned long a)
+{
+    int i;
+
+    for (i = 0; i < crash_nexec; i++)
+        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
+            return i;
+    return -1;
 }
 
 static int crash_in_code(unsigned long a)
 {
-    int i;
-
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
-            return 1;
-    return 0;
+    return crash_exec_find(a) >= 0;
 }
 
 static int crash_in_libc(unsigned long a)
 {
-    int i;
+    int i = crash_exec_find(a);
 
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
-            return !strcmp(crash_exec[i].name, "libc.so.6");
-    return 0;
+    return i >= 0 && !strcmp(crash_exec_name(i), "libc.so.6");
 }
 
 /* Prints "what 0x... lib+0xoff"; returns 1 if the address is in code. */
 static int crash_resolve(const char *what, unsigned long a)
 {
-    int i;
+    int i = crash_exec_find(a);
 
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi) {
-            dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a,
-                    crash_exec[i].name, crash_module_offset(i, a));
-            return 1;
-        }
+    if (i >= 0) {
+        dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a, crash_exec_name(i),
+                crash_module_offset(i, a));
+        return 1;
+    }
     dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx\n", what, a);
     return 0;
 }
@@ -475,7 +507,7 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     for (i = 0; sp && i < 16384 && found < 32; i++) {
         unsigned long *w = (unsigned long *)sp + i;
 
-        if ((unsigned long)(w + 1) > crash_stack_hi)
+        if (!crash_stack_hi || (unsigned long)(w + 1) > crash_stack_hi)
             break;
         if (crash_in_code(*w) && !crash_in_libc(*w))
             found += crash_resolve("stack", *w);

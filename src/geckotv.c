@@ -232,6 +232,48 @@ static void set_software_rendering(const char *profile, int on)
         unlink(tmp);
 }
 
+/* GECKOTV_EGL_TRACE=1 in the env file: a libwayland-egl.so.1 that logs every
+ * EGL window's create, resize and destroy with its thread goes in front of
+ * the TV's (src/wayland-egl-trace.c), and the adapter logs the GPU buffers
+ * and surfaces it sees. For a GPU crash whose EGL side is otherwise silent. */
+static void egl_trace_setup(const char *dir, const char *home, char *libpath, size_t size)
+{
+    static const char *const tv_libs[] = {
+        "/usr/lib/libwayland-egl.so.1", "/usr/lib/libwayland-egl.so.0",
+        "/lib/libwayland-egl.so.1", "/lib/libwayland-egl.so.0", NULL
+    };
+    char tracer[PATH_MAX];
+    char linkdir[PATH_MAX];
+    char link[PATH_MAX];
+    const char *tv = NULL;
+    size_t len = strlen(libpath);
+    int i;
+
+    for (i = 0; tv_libs[i] && !tv; i++)
+        if (access(tv_libs[i], F_OK) == 0)
+            tv = tv_libs[i];
+    snprintf(tracer, sizeof tracer, "%s/firefox-runtime/fallback/libwayland-egl-trace.so", dir);
+    if (!tv || access(tracer, R_OK) != 0) {
+        fprintf(stderr, "geckotv: GECKOTV_EGL_TRACE ignored: %s\n",
+                tv ? "no libwayland-egl-trace.so in the runtime" : "the TV has no wayland-egl");
+        return;
+    }
+    snprintf(linkdir, sizeof linkdir, "%s/.wayland-egl-trace", home);
+    snprintf(link, sizeof link, "%s/libwayland-egl.so.1", linkdir);
+    if (len + strlen(linkdir) + 2 >= size || (mkdir(linkdir, 0755) != 0 && errno != EEXIST) ||
+        (unlink(link) != 0 && errno != ENOENT) || symlink(tracer, link) != 0) {
+        fprintf(stderr, "geckotv: GECKOTV_EGL_TRACE ignored: cannot make %s\n", link);
+        return;
+    }
+    memmove(libpath + strlen(linkdir) + 1, libpath, len + 1);
+    memcpy(libpath, linkdir, strlen(linkdir));
+    libpath[strlen(linkdir)] = ':';
+    setenv("LD_LIBRARY_PATH", libpath, 1);
+    setenv("GECKOTV_EGL_TRACE_REAL", tv, 1);
+    setenv("WEBOS_XDG_EGL_TRACE", "1", 1);
+    fprintf(stderr, "geckotv: EGL window trace on, %s in front of %s\n", tracer, tv);
+}
+
 int main(int argc, char **argv)
 {
     char exe[PATH_MAX];
@@ -460,6 +502,12 @@ int main(int argc, char **argv)
         }
     }
     setenv("APPID", "com.github.gprot42.geckotv", 0);
+    {
+        const char *trace = getenv("GECKOTV_EGL_TRACE");
+
+        if (trace && strcmp(trace, "1") == 0)
+            egl_trace_setup(dir, home, libpath, sizeof libpath);
+    }
 
     /* GPU or software WebRender for this compositor (set_software_rendering).
      * GECKOTV_SOFTWARE=0|1 in <app dir>/env overrides the choice. */

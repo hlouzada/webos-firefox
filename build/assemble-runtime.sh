@@ -96,6 +96,11 @@ mkdir -p "$OUT/fallback"
 $SHIM_CC -O2 -Wall -fPIC -shared \
     -fvisibility=hidden -Wl,-soname,libwayland-egl.so.1 \
     -o "$OUT/fallback/libwayland-egl.so.1" /src/src/wayland-egl-shim.c -ldl
+# EGL window trace, put in front of the TV's libwayland-egl by the launcher
+# when GECKOTV_EGL_TRACE=1 is in the app's env file (src/wayland-egl-trace.c).
+$SHIM_CC -O2 -Wall -fPIC -shared \
+    -fvisibility=hidden -Wl,-soname,libwayland-egl.so.1 \
+    -o "$OUT/fallback/libwayland-egl-trace.so" /src/src/wayland-egl-trace.c -ldl -lpthread
 # getrandom() for TVs whose glibc lacks it (webOS 4); the launcher preloads it
 # there, since Firefox's Rust code otherwise needs /dev/random, which webOS 4's
 # app jail does not have.

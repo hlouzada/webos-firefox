@@ -5351,6 +5351,65 @@ void webos_xdg_wrapper_destroy_report(struct wl_proxy *proxy, void *caller)
             proxy_name(proxy), by);
 }
 
+/* WEBOS_XDG_EGL_TRACE=1 (set by the launcher for GECKOTV_EGL_TRACE=1): log
+ * the GPU driver's buffers and the surfaces they go to, with the thread, so
+ * the EGL side of a crash can be lined up with the wayland-egl trace. */
+static int egl_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_EGL_TRACE");
+
+        on = e && strcmp(e, "1") == 0;
+    }
+    return on;
+}
+
+static const char *surface_role(struct wl_proxy *surface)
+{
+    if (surface == (struct wl_proxy *)main_surface)
+        return "GTK window";
+    if (surface == gl_window)
+        return "card";
+    if (surface == (struct wl_proxy *)ov_surface)
+        return "overlay";
+    if (gp_find(surface))
+        return "GPU pop-up";
+    if (ov_item_find(surface))
+        return "overlay pop-up";
+    return "other";
+}
+
+static void egl_trace_request(struct wl_proxy *proxy, const char *name, uint32_t opcode,
+                              union wl_argument *args)
+{
+    struct wl_proxy *buffer;
+
+    if (ov_inside || !egl_trace_on())
+        return;
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH && args) {
+        buffer = (struct wl_proxy *)args[0].o;
+        pthread_mutex_lock(&ov_mu);
+        if (!buffer || !ov_buf_find(buffer))
+            log_msg("EGL trace: %s buffer %p attached to %s %p, tid %ld",
+                    buffer ? "GPU" : "no", (void *)buffer, surface_role(proxy), (void *)proxy,
+                    (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    } else if (!strcmp(name, "wl_buffer") && opcode == WL_BUFFER_DESTROY) {
+        pthread_mutex_lock(&ov_mu);
+        if (!ov_buf_find(proxy))
+            log_msg("EGL trace: GPU buffer %p destroyed, tid %ld", (void *)proxy,
+                    (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_DESTROY) {
+        pthread_mutex_lock(&ov_mu);
+        log_msg("EGL trace: %s %p destroyed, tid %ld", surface_role(proxy), (void *)proxy,
+                (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    }
+}
+
 /* GTK destroys its toplevel wl_surface when the window is hidden or closed.
  * Everything the adapter synthesizes names that surface: pointer enter and
  * leave for the overlay and the GL window, the text-input enter, the
@@ -5388,6 +5447,7 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
          * handlers on the evdev reader thread. */
     }
 
+    egl_trace_request(proxy, name, opcode, args);
     if (ov_intercept(proxy, name, opcode, interface, version, flags, args, out))
         return 1;
     if ((opcode == WL_BUFFER_DESTROY && !strcmp(name, "wl_buffer")) ||

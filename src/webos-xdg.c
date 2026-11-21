@@ -472,8 +472,8 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     if (webos_printf_trace_get)
         last = *webos_printf_trace_get();
 
-    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p thread %ld\n", sig,
-            info ? info->si_addr : NULL, (long)syscall(SYS_gettid));
+    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p pid %ld thread %ld\n", sig,
+            info ? info->si_addr : NULL, (long)getpid(), (long)syscall(SYS_gettid));
 #if defined(__arm__)
     pc = uc->uc_mcontext.arm_pc;
     lr = uc->uc_mcontext.arm_lr;

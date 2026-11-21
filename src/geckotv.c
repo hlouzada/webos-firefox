@@ -4,10 +4,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -248,6 +252,121 @@ static void write_launcher_prefs(const char *profile, int software)
         rename(tmp, path);
     else
         unlink(tmp);
+}
+
+#define APP_ID "com.github.gprot42.geckotv"
+
+/* The app manager restarts a native app on every relaunch (opening it again
+ * from Home) unless the app has registered: the old process gets SIGTERM and
+ * a new one starts on the restored session. The registration is a luna
+ * subscription that must stay open as long as the app runs. The hub knows
+ * the app by its executable, this launcher, so the subscription is held by a
+ * forked child that never execs and dies with this process; luna-send has
+ * the wrong executable and the jail offers the public bus only. Replies go to
+ * the log. */
+typedef struct LSHandle LSHandle;
+typedef struct LSMessage LSMessage;
+typedef bool (*LSFilterFunc)(LSHandle *sh, LSMessage *msg, void *ctx);
+
+struct app_manager_ctx {
+    const char *(*payload)(LSMessage *);
+    int relaunch_fd;    /* one byte per relaunch, read by the adapter */
+};
+
+static bool app_manager_reply(LSHandle *sh, LSMessage *msg, void *ctx)
+{
+    struct app_manager_ctx *c = ctx;
+    const char *text = c->payload(msg);
+
+    (void)sh;
+    fprintf(stderr, "geckotv: app manager: %s\n", text);
+    if (text && strstr(text, "\"relaunch\"") && write(c->relaunch_fd, "r", 1) != 1)
+        perror("geckotv: relaunch pipe");
+    return true;
+}
+
+static void hold_app_manager_registration(int relaunch_fd)
+{
+    static struct app_manager_ctx ctx;
+    void *ls = dlopen("libluna-service2.so.3", RTLD_NOW);
+    void *glib = dlopen("libglib-2.0.so.0", RTLD_NOW);
+    bool (*ls_register)(const char *, LSHandle **, void *);
+    bool (*ls_attach)(LSHandle *, void *, void *);
+    bool (*ls_call)(LSHandle *, const char *, const char *, LSFilterFunc, void *, void *, void *);
+    const char *(*ls_payload)(LSMessage *);
+    void (*ls_error_init)(void *);
+    void (*ls_error_print)(void *, FILE *);
+    void *(*loop_new)(void *, int);
+    void (*loop_run)(void *);
+    unsigned char lserror[512];
+    LSHandle *sh = NULL;
+    void *loop;
+
+    if (!ls || !glib) {
+        fprintf(stderr, "geckotv: registerNativeApp: %s\n", dlerror());
+        _exit(1);
+    }
+    ls_register = (bool (*)(const char *, LSHandle **, void *))dlsym(ls, "LSRegister");
+    ls_attach = (bool (*)(LSHandle *, void *, void *))dlsym(ls, "LSGmainAttach");
+    ls_call = (bool (*)(LSHandle *, const char *, const char *, LSFilterFunc, void *, void *,
+                        void *))dlsym(ls, "LSCall");
+    ls_payload = (const char *(*)(LSMessage *))dlsym(ls, "LSMessageGetPayload");
+    ls_error_init = (void (*)(void *))dlsym(ls, "LSErrorInit");
+    ls_error_print = (void (*)(void *, FILE *))dlsym(ls, "LSErrorPrint");
+    loop_new = (void *(*)(void *, int))dlsym(glib, "g_main_loop_new");
+    loop_run = (void (*)(void *))dlsym(glib, "g_main_loop_run");
+    if (!ls_register || !ls_attach || !ls_call || !ls_payload || !ls_error_init ||
+        !ls_error_print || !loop_new || !loop_run) {
+        fprintf(stderr, "geckotv: registerNativeApp: luna-service2 symbols missing\n");
+        _exit(1);
+    }
+    memset(lserror, 0, sizeof lserror);
+    ls_error_init(lserror);
+    loop = loop_new(NULL, 0);
+    ctx.payload = ls_payload;
+    ctx.relaunch_fd = relaunch_fd;
+    if (!ls_register(APP_ID, &sh, lserror) || !ls_attach(sh, loop, lserror) ||
+        !ls_call(sh, "luna://com.webos.applicationManager/registerNativeApp",
+                 "{\"subscribe\":true}", app_manager_reply, &ctx, NULL, lserror)) {
+        fprintf(stderr, "geckotv: registerNativeApp failed: ");
+        ls_error_print(lserror, stderr);
+        _exit(1);
+    }
+    loop_run(loop);
+    _exit(0);
+}
+
+/* The compositor minimizes the card on Home and does not restore it on a
+ * relaunch by itself: the adapter asks for the fullscreen state again when a
+ * byte arrives on the pipe named by GECKOTV_RELAUNCH_FD. */
+static void register_with_app_manager(void)
+{
+    int fds[2];
+    char num[16];
+    pid_t pid;
+
+    if (pipe(fds) != 0) {
+        perror("geckotv: pipe for relaunch");
+        return;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("geckotv: fork for registerNativeApp");
+        close(fds[0]);
+        close(fds[1]);
+        return;
+    }
+    if (pid > 0) {
+        close(fds[1]);
+        snprintf(num, sizeof num, "%d", fds[0]);
+        setenv("GECKOTV_RELAUNCH_FD", num, 1);
+        return;
+    }
+    close(fds[0]);
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() == 1)
+        _exit(0);
+    hold_app_manager_registration(fds[1]);
 }
 
 /* GECKOTV_EGL_TRACE=1 in the env file: a libwayland-egl.so.1 that logs every
@@ -730,6 +849,7 @@ int main(int argc, char **argv)
                "luna://com.webos.service.mrcu/setHotkeyCursorPolicy "
                "'{\"button\":19,\"cursorPolicy\":2}' >/tmp/mrcu-policy.log 2>&1");
     }
+    register_with_app_manager();
     execv(firefox, args);
     perror("execv firefox");
     return 1;

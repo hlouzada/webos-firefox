@@ -2409,6 +2409,55 @@ static int flat_hidden(struct wl_proxy *surface)
     return r;
 }
 
+static struct wl_webos_shell_surface *gl_webos;  /* defined with the GL window state below */
+
+/* The launcher's app-manager child writes a byte here for every relaunch
+ * (the app opened again from Home). The compositor minimized the card on
+ * Home and does not restore it on its own: ask for the fullscreen state
+ * again. With ov_mu held. */
+static void relaunch_poll(void)
+{
+    static int fd = -2;
+    char buf[16];
+    ssize_t n;
+    int i;
+
+    if (fd == -2) {
+        const char *e = getenv("GECKOTV_RELAUNCH_FD");
+
+        fd = e && e[0] ? atoi(e) : -1;
+        if (fd >= 0 && fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) != 0) {
+            log_msg("relaunch pipe %d: %s", fd, strerror(errno));
+            fd = -1;
+        }
+    }
+    if (fd < 0)
+        return;
+    n = read(fd, buf, sizeof buf);
+    if (n == 0) {
+        log_msg("relaunch pipe closed: the app manager child is gone");
+        fd = -1;
+        return;
+    }
+    if (n < 0)
+        return;
+    ov_inside = 1;
+    if (gl_webos) {
+        wl_webos_shell_surface_set_state(gl_webos, WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+        log_msg("relaunch: GL window asked to be fullscreen again");
+    }
+    for (i = 0; i < MAX_VIRT; i++)
+        if (g.virts[i].proxy && g.virts[i].kind == V_SURFACE && g.virts[i].webos_surface) {
+            wl_webos_shell_surface_set_state(g.virts[i].webos_surface,
+                                             WL_WEBOS_SHELL_SURFACE_STATE_FULLSCREEN);
+            log_msg("relaunch: window %p asked to be fullscreen again",
+                    (void *)g.virts[i].wl_surface);
+        }
+    if (g.display)
+        wl_display_flush(g.display);
+    ov_inside = 0;
+}
+
 /* Every 20 ms: a redraw waiting for a buffer is retried (when the compositor
  * keeps its buffers no release event comes to retry it, see ov_redraw), and
  * pending frame callbacks and releases are answered. */
@@ -2421,6 +2470,7 @@ static void *flat_pump(void *unused)
         usleep(20 * 1000);
         pthread_mutex_lock(&ov_mu);
         video_accept();
+        relaunch_poll();
         if ((ov_dirty || ov_flat_test()) && ov_surface)
             ov_update();
         flat_answer_maybe();

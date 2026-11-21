@@ -622,7 +622,7 @@ new file mode 100644
 index 0000000000..2f9d14a41f
 --- /dev/null
 +++ b/dom/media/platforms/webos/WebOSEngine.cpp
-@@ -0,0 +1,991 @@
+@@ -0,0 +1,996 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1355,6 +1355,11 @@ index 0000000000..2f9d14a41f
 +void WebOSEngineChannel::Shutdown() {
 +  mOwnerGone = true;
 +  mInited = false;
++  // Hang up on the adapter now, on this thread: the next engine connects
++  // before this queue reaches Close().
++  if (mAdapterFd >= 0) {
++    shutdown(mAdapterFd, SHUT_RDWR);
++  }
 +  (void)mTaskQueue->Dispatch(NS_NewRunnableFunction(
 +      "WebOSEngineChannel::Shutdown", [self = RefPtr{this}, this] {
 +        Close();
@@ -1739,7 +1744,7 @@ index 0000000000..50f568acb2
 +
 +  int mFd = -1;
 +  pid_t mPid = 0;
-+  int mAdapterFd = -1;
++  Atomic<int> mAdapterFd{-1};
 +  nsCString mWindowId;
 +
 +  Track mVideo;

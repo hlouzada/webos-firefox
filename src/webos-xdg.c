@@ -326,110 +326,142 @@ static ssize_t read_own_memory(void *dst, const void *src, size_t n)
     return syscall(SYS_process_vm_readv, getpid(), &local, 1UL, &remote, 1UL, 0UL);
 }
 
-/* Executable mappings, read once in the crash handler without stdio or
- * malloc (the fault may be inside malloc). */
-static char crash_maps[192 * 1024];
-static struct { unsigned long lo, hi, pgoff; const char *name; } crash_exec[512];
-/* Each mapped file's first mapping (see crash_load_maps). */
-static struct { const char *name; unsigned long lo; } crash_base[64];
-static int crash_nbase;
-static int crash_nexec;
-static unsigned long crash_stack_hi;
+/* Executable mappings, read in the crash handler without stdio or malloc
+ * (the fault may be inside malloc). /proc/self/maps is streamed line by
+ * line: the Firefox parent has thousands of mappings. */
+#define CRASH_FILES 256
+#define CRASH_EXEC 2048
+static struct { char name[48]; unsigned long base; } crash_file[CRASH_FILES];
+static struct { unsigned long lo, hi, pgoff; int file; } crash_exec[CRASH_EXEC];
+static int crash_nfile, crash_nexec, crash_nexec_lost;
+static unsigned long crash_stack_lo, crash_stack_hi;
 
-static void crash_load_maps(unsigned long sp)
+static int crash_file_index(const char *name)
 {
-    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-    size_t len = 0;
-    ssize_t r;
-    char *p, *end;
+    int k;
 
-    if (fd < 0)
+    for (k = 0; k < crash_nfile; k++)
+        if (!strcmp(crash_file[k].name, name))
+            return k;
+    if (crash_nfile == CRASH_FILES)
+        return -1;
+    strncpy(crash_file[k].name, name, sizeof crash_file[k].name - 1);
+    crash_file[k].base = 0;
+    crash_nfile++;
+    return k;
+}
+
+/* One line of /proc/self/maps: "lo-hi perms pgoff dev inode path". */
+static void crash_map_line(char *line, unsigned long sp)
+{
+    unsigned long lo, hi, pgoff;
+    char *q, *perms, *slash;
+    int file = -1;
+
+    lo = strtoul(line, &q, 16);
+    if (*q != '-')
         return;
-    while (len < sizeof crash_maps - 1 &&
-           (r = read(fd, crash_maps + len, sizeof crash_maps - 1 - len)) > 0)
-        len += r;
-    close(fd);
-    crash_maps[len] = '\0';
-    for (p = crash_maps; *p && crash_nexec < 512; p = end + 1) {
-        unsigned long lo, hi, pgoff;
-        char *q, *slash;
-
-        end = strchr(p, '\n');
-        if (!end)
-            break;
-        *end = '\0';
-        lo = strtoul(p, &q, 16);
-        hi = strtoul(q + 1, &q, 16);
-        if (sp >= lo && sp < hi)
-            crash_stack_hi = hi;
-        pgoff = strtoul(q + 6, &q, 16);
-        slash = strrchr(q, '/');
+    hi = strtoul(q + 1, &q, 16);
+    if (q[0] != ' ' || strlen(q) < 6)
+        return;
+    perms = q + 1;                                       /* "r-xp" */
+    pgoff = strtoul(perms + 5, &q, 16);
+    if (sp >= lo && sp < hi) {
+        crash_stack_lo = lo;
+        crash_stack_hi = hi;
+    }
+    slash = strrchr(q, '/');
+    if (slash) {
+        file = crash_file_index(slash + 1);
         /* The file's first mapping (offset 0) is where its address 0 is:
          * offsets printed from it match nm and addr2line. A file offset
          * does not: lld puts code 64 KB higher in memory than in the file
          * (the firefox binary), GNU ld does not (GTK's libraries). */
-        if (pgoff == 0 && slash && crash_nbase < 64) {
-            int k;
+        if (file >= 0 && pgoff == 0 && crash_file[file].base == 0)
+            crash_file[file].base = lo;
+    }
+    if (perms[2] != 'x')
+        return;
+    if (crash_nexec == CRASH_EXEC) {
+        crash_nexec_lost++;
+        return;
+    }
+    crash_exec[crash_nexec].lo = lo;
+    crash_exec[crash_nexec].hi = hi;
+    crash_exec[crash_nexec].pgoff = pgoff;
+    crash_exec[crash_nexec].file = file;
+    crash_nexec++;
+}
 
-            for (k = 0; k < crash_nbase && strcmp(crash_base[k].name, slash + 1); k++)
-                ;
-            if (k == crash_nbase) {
-                crash_base[k].name = slash + 1;
-                crash_base[k].lo = lo;
-                crash_nbase++;
+static void crash_load_maps(unsigned long sp)
+{
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    char buf[4096], line[512];
+    size_t ll = 0;
+    ssize_t r, i;
+
+    if (fd < 0)
+        return;
+    while ((r = read(fd, buf, sizeof buf)) > 0) {
+        for (i = 0; i < r; i++) {
+            if (buf[i] == '\n') {
+                line[ll] = '\0';
+                crash_map_line(line, sp);
+                ll = 0;
+            } else if (ll < sizeof line - 1) {
+                line[ll++] = buf[i];      /* a longer line loses its tail */
             }
         }
-        if (q[3] != 'x')                       /* " r-xp" */
-            continue;
-        crash_exec[crash_nexec].lo = lo;
-        crash_exec[crash_nexec].hi = hi;
-        crash_exec[crash_nexec].pgoff = pgoff;
-        crash_exec[crash_nexec].name = slash ? slash + 1 : "[anon]";
-        crash_nexec++;
     }
+    close(fd);
+}
+
+static const char *crash_exec_name(int i)
+{
+    return crash_exec[i].file >= 0 ? crash_file[crash_exec[i].file].name : "[anon]";
 }
 
 static unsigned long crash_module_offset(int i, unsigned long a)
 {
-    int k;
+    int f = crash_exec[i].file;
 
-    for (k = 0; k < crash_nbase; k++)
-        if (!strcmp(crash_base[k].name, crash_exec[i].name) && crash_base[k].lo <= a)
-            return a - crash_base[k].lo;
+    if (f >= 0 && crash_file[f].base && crash_file[f].base <= a)
+        return a - crash_file[f].base;
     return a - crash_exec[i].lo + crash_exec[i].pgoff;
+}
+
+static int crash_exec_find(unsigned long a)
+{
+    int i;
+
+    for (i = 0; i < crash_nexec; i++)
+        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
+            return i;
+    return -1;
 }
 
 static int crash_in_code(unsigned long a)
 {
-    int i;
-
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
-            return 1;
-    return 0;
+    return crash_exec_find(a) >= 0;
 }
 
 static int crash_in_libc(unsigned long a)
 {
-    int i;
+    int i = crash_exec_find(a);
 
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi)
-            return !strcmp(crash_exec[i].name, "libc.so.6");
-    return 0;
+    return i >= 0 && !strcmp(crash_exec_name(i), "libc.so.6");
 }
 
 /* Prints "what 0x... lib+0xoff"; returns 1 if the address is in code. */
 static int crash_resolve(const char *what, unsigned long a)
 {
-    int i;
+    int i = crash_exec_find(a);
 
-    for (i = 0; i < crash_nexec; i++)
-        if (a >= crash_exec[i].lo && a < crash_exec[i].hi) {
-            dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a,
-                    crash_exec[i].name, crash_module_offset(i, a));
-            return 1;
-        }
+    if (i >= 0) {
+        dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx %s+%#lx\n", what, a, crash_exec_name(i),
+                crash_module_offset(i, a));
+        return 1;
+    }
     dprintf(STDERR_FILENO, "webos-xdg:   %s %#lx\n", what, a);
     return 0;
 }
@@ -453,8 +485,8 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     if (webos_printf_trace_get)
         last = *webos_printf_trace_get();
 
-    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p thread %ld\n", sig,
-            info ? info->si_addr : NULL, (long)syscall(SYS_gettid));
+    dprintf(STDERR_FILENO, "\nwebos-xdg: signal %d addr=%p pid %ld thread %ld\n", sig,
+            info ? info->si_addr : NULL, (long)getpid(), (long)syscall(SYS_gettid));
 #if defined(__arm__)
     pc = uc->uc_mcontext.arm_pc;
     lr = uc->uc_mcontext.arm_lr;
@@ -465,8 +497,20 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     sp = uc->uc_mcontext.sp;
 #endif
     crash_load_maps(sp);
+    dprintf(STDERR_FILENO, "webos-xdg:   maps: %d code mappings%s, %d files, stack %#lx-%#lx\n",
+            crash_nexec, crash_nexec_lost ? " (table full)" : "", crash_nfile, crash_stack_lo,
+            crash_stack_hi);
     crash_resolve("pc", pc);
     crash_resolve("lr", lr);
+#if defined(__arm__)
+    dprintf(STDERR_FILENO, "webos-xdg:   r0 %#lx r1 %#lx r2 %#lx r3 %#lx r4 %#lx r5 %#lx r6 %#lx\n",
+            uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1, uc->uc_mcontext.arm_r2,
+            uc->uc_mcontext.arm_r3, uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5,
+            uc->uc_mcontext.arm_r6);
+    dprintf(STDERR_FILENO, "webos-xdg:   r7 %#lx r8 %#lx r9 %#lx r10 %#lx fp %#lx ip %#lx sp %#lx\n",
+            uc->uc_mcontext.arm_r7, uc->uc_mcontext.arm_r8, uc->uc_mcontext.arm_r9,
+            uc->uc_mcontext.arm_r10, uc->uc_mcontext.arm_fp, uc->uc_mcontext.arm_ip, sp);
+#endif
     if (webos_printf_trace_get) {
         struct printf_trace *t = &last;
         char fmt[160] = "";
@@ -488,7 +532,7 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     for (i = 0; sp && i < 16384 && found < 32; i++) {
         unsigned long *w = (unsigned long *)sp + i;
 
-        if ((unsigned long)(w + 1) > crash_stack_hi)
+        if (!crash_stack_hi || (unsigned long)(w + 1) > crash_stack_hi)
             break;
         if (crash_in_code(*w) && !crash_in_libc(*w))
             found += crash_resolve("stack", *w);
@@ -1563,9 +1607,10 @@ static void video_client_read(void)
         video_line_len = 0;
 }
 
-/* One client at a time, and only one started by this user. A client that
- * went away makes room for the next one at once. Called every 20 ms under
- * ov_mu from flat_pump. */
+/* One client at a time, and only one started by this user. A new client
+ * takes over from the current one: an engine still shutting down must not
+ * keep the next video off the screen. Called every 20 ms under ov_mu from
+ * flat_pump. */
 static void video_accept(void)
 {
     struct ucred cred;
@@ -1585,10 +1630,9 @@ static void video_accept(void)
         if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != getuid()) {
             log_msg("video socket: refused a connection from uid %u", (unsigned)cred.uid);
             close(fd);
-        } else if (video_client_fd >= 0) {
-            log_msg("video socket: a second client refused");
-            close(fd);
         } else {
+            if (video_client_fd >= 0)
+                video_client_gone("replaced");
             video_client_fd = fd;
             log_msg("video client connected (pid %d)", (int)cred.pid);
             video_id_unsent = 1;
@@ -5393,6 +5437,85 @@ void webos_xdg_wrapper_destroy_report(struct wl_proxy *proxy, void *caller)
             proxy_name(proxy), by);
 }
 
+/* WEBOS_XDG_EGL_TRACE=1 (set by the launcher for GECKOTV_EGL_TRACE=1): log
+ * the GPU driver's buffers and the surfaces they go to, with the thread, so
+ * the EGL side of a crash can be lined up with the wayland-egl trace. */
+static int egl_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("WEBOS_XDG_EGL_TRACE");
+
+        on = e && strcmp(e, "1") == 0;
+    }
+    return on;
+}
+
+static const char *surface_role(struct wl_proxy *surface)
+{
+    if (surface == (struct wl_proxy *)main_surface)
+        return "GTK window";
+    if (surface == gl_window)
+        return "card";
+    if (surface == (struct wl_proxy *)ov_surface)
+        return "overlay";
+    if (gp_find(surface))
+        return "GPU pop-up";
+    if (ov_item_find(surface))
+        return "overlay pop-up";
+    return "other";
+}
+
+static void egl_trace_request(struct wl_proxy *proxy, const char *name, uint32_t opcode,
+                              union wl_argument *args)
+{
+    struct wl_proxy *buffer;
+
+    if (ov_inside || !egl_trace_on())
+        return;
+    if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_ATTACH && args) {
+        buffer = (struct wl_proxy *)args[0].o;
+        pthread_mutex_lock(&ov_mu);
+        if (!buffer || !ov_buf_find(buffer))
+            log_msg("EGL trace: %s buffer %p attached to %s %p, tid %ld",
+                    buffer ? "GPU" : "no", (void *)buffer, surface_role(proxy), (void *)proxy,
+                    (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    } else if (!strcmp(name, "wl_buffer") && opcode == WL_BUFFER_DESTROY) {
+        pthread_mutex_lock(&ov_mu);
+        if (!ov_buf_find(proxy))
+            log_msg("EGL trace: GPU buffer %p destroyed, tid %ld", (void *)proxy,
+                    (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    } else if (!strcmp(name, "wl_surface") && opcode == WL_SURFACE_DESTROY) {
+        pthread_mutex_lock(&ov_mu);
+        log_msg("EGL trace: %s %p destroyed, tid %ld", surface_role(proxy), (void *)proxy,
+                (long)syscall(SYS_gettid));
+        pthread_mutex_unlock(&ov_mu);
+    }
+}
+
+/* GTK destroys its toplevel wl_surface when the window is hidden or closed.
+ * Everything the adapter synthesizes names that surface: pointer enter and
+ * leave for the overlay and the GL window, the text-input enter, the
+ * held-back keyboard leave. A GDK handler given the freed proxy reads its
+ * user data from freed memory. */
+static void main_surface_destroyed(void)
+{
+    int i;
+
+    log_msg("main window surface %p destroyed", (void *)main_surface);
+    main_surface = NULL;
+    synth_focus = NULL;
+    keyboard_focus_raw = NULL;
+    for (i = 0; i < MAX_HOOK; i++)
+        keyboard_hooks[i].held_leave = 0;
+    text_input_entered = 0;
+    /* The next window GTK maps is the first one again. */
+    mapped_one = 0;
+}
+
 int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
                         const struct wl_interface *interface, uint32_t version,
                         uint32_t flags, union wl_argument *args, struct wl_proxy **out)
@@ -5410,6 +5533,7 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
          * handlers on the evdev reader thread. */
     }
 
+    egl_trace_request(proxy, name, opcode, args);
     if (ov_intercept(proxy, name, opcode, interface, version, flags, args, out))
         return 1;
     if ((opcode == WL_BUFFER_DESTROY && !strcmp(name, "wl_buffer")) ||
@@ -5490,6 +5614,8 @@ int webos_xdg_intercept(struct wl_proxy *proxy, uint32_t opcode,
         forget_shell_role(proxy);
         if (ov_enabled())
             ov_surface_destroyed(proxy);
+        if ((struct wl_surface *)proxy == main_surface)
+            main_surface_destroyed();
         if (main_group && (struct wl_surface *)proxy == group_root)
             drop_group();
     }

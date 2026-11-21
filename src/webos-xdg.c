@@ -489,6 +489,15 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
             crash_stack_hi);
     crash_resolve("pc", pc);
     crash_resolve("lr", lr);
+#if defined(__arm__)
+    dprintf(STDERR_FILENO, "webos-xdg:   r0 %#lx r1 %#lx r2 %#lx r3 %#lx r4 %#lx r5 %#lx r6 %#lx\n",
+            uc->uc_mcontext.arm_r0, uc->uc_mcontext.arm_r1, uc->uc_mcontext.arm_r2,
+            uc->uc_mcontext.arm_r3, uc->uc_mcontext.arm_r4, uc->uc_mcontext.arm_r5,
+            uc->uc_mcontext.arm_r6);
+    dprintf(STDERR_FILENO, "webos-xdg:   r7 %#lx r8 %#lx r9 %#lx r10 %#lx fp %#lx ip %#lx sp %#lx\n",
+            uc->uc_mcontext.arm_r7, uc->uc_mcontext.arm_r8, uc->uc_mcontext.arm_r9,
+            uc->uc_mcontext.arm_r10, uc->uc_mcontext.arm_fp, uc->uc_mcontext.arm_ip, sp);
+#endif
     if (webos_printf_trace_get) {
         struct printf_trace *t = &last;
         char fmt[160] = "";

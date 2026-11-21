@@ -1530,9 +1530,10 @@ static void video_client_read(void)
         video_line_len = 0;
 }
 
-/* One client at a time, and only one started by this user. A client that
- * went away makes room for the next one at once. Called every 20 ms under
- * ov_mu from flat_pump. */
+/* One client at a time, and only one started by this user. A new client
+ * takes over from the current one: an engine still shutting down must not
+ * keep the next video off the screen. Called every 20 ms under ov_mu from
+ * flat_pump. */
 static void video_accept(void)
 {
     struct ucred cred;
@@ -1552,10 +1553,9 @@ static void video_accept(void)
         if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || cred.uid != getuid()) {
             log_msg("video socket: refused a connection from uid %u", (unsigned)cred.uid);
             close(fd);
-        } else if (video_client_fd >= 0) {
-            log_msg("video socket: a second client refused");
-            close(fd);
         } else {
+            if (video_client_fd >= 0)
+                video_client_gone("replaced");
             video_client_fd = fd;
             log_msg("video client connected (pid %d)", (int)cred.pid);
             video_id_unsent = 1;

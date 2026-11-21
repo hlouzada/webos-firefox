@@ -484,6 +484,9 @@ static void on_crash(int sig, siginfo_t *info, void *ctx)
     sp = uc->uc_mcontext.sp;
 #endif
     crash_load_maps(sp);
+    dprintf(STDERR_FILENO, "webos-xdg:   maps: %d code mappings%s, %d files, stack %#lx-%#lx\n",
+            crash_nexec, crash_nexec_lost ? " (table full)" : "", crash_nfile, crash_stack_lo,
+            crash_stack_hi);
     crash_resolve("pc", pc);
     crash_resolve("lr", lr);
     if (webos_printf_trace_get) {
